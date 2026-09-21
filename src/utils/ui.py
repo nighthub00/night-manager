@@ -2387,7 +2387,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         lay.addWidget(kill_roblox_button)
         lay.addSpacing(8)
 
-        ver_lbl = QLabel(f"v{APP_VERSION}  \u00b7  based on Evanovar RAM")
+        ver_lbl = QLabel(f"v{APP_VERSION}")
         ver_lbl.setObjectName("versionText")
         ver_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         lay.addWidget(ver_lbl)
