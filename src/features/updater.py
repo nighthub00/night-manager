@@ -18,16 +18,16 @@ from typing import Callable
 import requests
 
 from utils.app_paths import get_data_dir
+from utils.version import APP_NAME
 
-GITHUB_API = "https://api.github.com/repos/evanovar/RobloxAccountManager/releases/latest"
-RELEASES_PAGE = "https://github.com/evanovar/RobloxAccountManager/releases/latest"
+# Updates come only from NIGHT MANAGER's own releases. Pointing this at the
+# upstream Evanovar RAM repository would replace this build with theirs.
+UPDATE_REPOSITORY = "nighthub00/night-manager"
+GITHUB_API = f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest"
+RELEASES_PAGE = f"https://github.com/{UPDATE_REPOSITORY}/releases/latest"
 RELEASE_ASSET_PATTERN = re.compile(
-    r"^EvanovarRAM-v\d+\.\d+\.\d+(?:\.\d+)?\.exe$",
+    r"^NightManager-v\d+\.\d+\.\d+(?:\.\d+)?\.exe$",
     re.IGNORECASE,
-)
-LEGACY_ASSET_NAMES = (
-    "EvanovarRAM.exe",
-    "RobloxAccountManager.exe",
 )
 PROCESS_WAIT_SECONDS = 120
 REPLACE_WAIT_SECONDS = 30
@@ -74,7 +74,7 @@ def get_exe_download_url() -> tuple[str, str] | None:
         release_tag = str(release.get("tag_name", "")).strip()
         if release_tag and not release_tag.lower().startswith("v"):
             release_tag = f"v{release_tag}"
-        expected_name = f"EvanovarRAM-{release_tag}.exe" if release_tag else ""
+        expected_name = f"NightManager-{release_tag}.exe" if release_tag else ""
         preferred = next(
             (
                 asset
@@ -92,21 +92,30 @@ def get_exe_download_url() -> tuple[str, str] | None:
             ),
             None,
         )
-        selected = selected or next(
-            (
-                asset
-                for asset in assets
-                if asset["name"].lower()
-                in {name.lower() for name in LEGACY_ASSET_NAMES}
-            ),
-            None,
-        )
         if not selected:
             return None
         return selected["browser_download_url"], selected["name"]
     except Exception as exc:
         print(f"[ERROR] get_exe_download_url error: {exc}")
         return None
+
+
+def read_product_name(path: str) -> str:
+    """Return the ProductName stored in an executable's version resource."""
+    try:
+        import win32api
+
+        translations = win32api.GetFileVersionInfo(path, r"\VarFileInfo\Translation")
+        for language, codepage in translations or ():
+            name = win32api.GetFileVersionInfo(
+                path,
+                rf"\StringFileInfo\{language:04x}{codepage:04x}\ProductName",
+            )
+            if name:
+                return str(name).strip()
+    except Exception:
+        pass
+    return ""
 
 
 def get_update_target() -> str | None:
@@ -182,7 +191,7 @@ try {{
     Remove-Item -LiteralPath $UpdateDirectory -Force -ErrorAction SilentlyContinue
     exit 0
 }} catch {{
-    $detail = "Evanovar RAM automatic update failed.`r`n"
+    $detail = "NIGHT MANAGER automatic update failed.`r`n"
     $detail += "Timestamp: $([DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss'))`r`n"
     $detail += "Destination: $DestinationPath`r`n"
     $detail += "Error: $($_.Exception.Message)"
@@ -248,14 +257,14 @@ def download_update(
             on_progress(0)
             result = get_exe_download_url()
             if not result:
-                on_done(False, "No Evanovar RAM executable was found in the latest release.")
+                on_done(False, f"No {APP_NAME} executable was found in the latest release.")
                 return
 
             url, filename = result
             print(f"[INFO] Downloading {filename} from {url}")
             on_progress(2)
 
-            update_directory = tempfile.mkdtemp(prefix="evanovar_ram_update_")
+            update_directory = tempfile.mkdtemp(prefix="night_manager_update_")
             source_path = os.path.join(update_directory, "update.exe")
 
             response = requests.get(url, stream=True, timeout=60)
@@ -274,6 +283,13 @@ def download_update(
 
             if not os.path.isfile(source_path) or os.path.getsize(source_path) == 0:
                 raise RuntimeError("The downloaded update file is empty.")
+
+            product_name = read_product_name(source_path)
+            if product_name != APP_NAME:
+                raise RuntimeError(
+                    f"The downloaded file is not a {APP_NAME} build "
+                    f"(product name: {product_name or 'missing'}). The update was refused."
+                )
 
             _launch_installer(source_path, target, update_directory)
             installer_started = True

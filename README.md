@@ -1,74 +1,21 @@
-[![Latest release](https://img.shields.io/github/v/release/evanovar/RobloxAccountManager?label=release)](https://github.com/evanovar/RobloxAccountManager/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/evanovar/RobloxAccountManager/total)](https://github.com/evanovar/RobloxAccountManager/releases)
-[![License](https://img.shields.io/github/license/evanovar/RobloxAccountManager)](LICENSE)
-[![Discord](https://img.shields.io/discord/1436930121897476140?label=Discord)](https://discord.gg/SZaZU8zwZA)
-[![Website](https://img.shields.io/badge/website-evanovarram.com-1F58FF)](https://www.evanovarram.com/)
-![OS](https://img.shields.io/badge/os-windows-0078D4)<br>
-[![Download](https://img.shields.io/badge/Download-280ab?style=for-the-badge)](https://github.com/evanovar/RobloxAccountManager/releases/latest)
+<p align="center"><img src="assets/logo.png" width="112" alt="NIGHT MANAGER logo"></p>
 
-> [!IMPORTANT]
-> Before you see this as a **"Virus"** or **"Unofficial,"** please read:
-> - **Project Status:** This project was inspired by the original Roblox Account Manager by ic3w0lf22. I recreated it in Python as a personal project because I thought it would be fun to build and learn from. It is not intended to be an official continuation of the original project.<br><br>
-> - **100% Open Source:** Every line of code is transparent and available for everyone. If you don't trust the .exe, you are encouraged to run the script directly from the source code.<br><br>
-> - **Integrity:** The standalone .exe in the releases is compiled directly from this code with zero alterations.
+<h1 align="center">NIGHT MANAGER</h1>
 
-# Evanovar RAM
+<p align="center">A Windows desktop app for managing, launching and keeping multiple Roblox accounts running.<br>
+by NightHub &middot; <a href="https://discord.gg/nighthubqx">Discord</a></p>
 
-Evanovar RAM is an open source Windows desktop application for organizing Roblox accounts, launching multiple clients, and automating common account management tasks. It combines encrypted local storage, multi-account launching, process controls, Roblox settings management, and diagnostics in one interface.
-
-[Download the latest release](https://github.com/evanovar/RobloxAccountManager/releases/latest) | [Documentation](https://www.evanovarram.com/documentation/developer) | [Discord](https://discord.gg/SZaZU8zwZA) | [Website](https://www.evanovarram.com/)
-
-![Evanovar RAM account manager interface](https://github.com/user-attachments/assets/6dab4d69-11fd-47d0-9348-db2aef5211fb)
-
-## Table of contents
-
-- [Installation](#installation)
-- [Features](#features)
-- [Data and privacy](#data-and-privacy)
-- [Build from source](#build-from-source)
-- [System changes and uninstallation](#system-changes-and-uninstallation)
-- [Disclaimer](#disclaimer)
-- [Contributing](#contributing)
-- [Support](#support)
-- [License](#license)
-
-## Highlights
-
-- Organize accounts with groups, notes, avatars, drag-and-drop ordering, and multi-select actions.
-- Launch one or many accounts into public games, private servers, specific jobs, or small servers.
-- Run multiple Roblox clients using the default mutex method or Handle64 mode.
-- Monitor and recover sessions with Auto-Rejoin, Anti-AFK, activity data, and structured diagnostics.
-- Manage Roblox windows with custom titles, headless mode, global grid tiling, and process controls.
-- Edit Roblox settings through basic presets or a searchable advanced settings editor.
-- Protect saved account data with hardware encryption or password encryption.
-- Use Chrome, Firefox, Edge, or the optional portable Chromium browser for account login flows.
+> NIGHT MANAGER is a modified version of [Evanovar RAM](https://github.com/evanovar/RobloxAccountManager) by evanovar,
+> redistributed under the GNU General Public License v3. The account, launch and automation features come from
+> Evanovar RAM; NIGHT MANAGER adds its own interface, branding and release channel.
 
 ## Installation
 
-### Windows executable
+1. Download `NightManager-v<version>.exe` from the [latest release](https://github.com/nighthub00/night-manager/releases/latest).
+2. Put it in its own folder. Saved accounts live in `AccountManagerData/` next to the executable.
+3. Run it.
 
-1. Open the [latest release](https://github.com/evanovar/RobloxAccountManager/releases/latest).
-2. Download `EvanovarRAM-v<version>.exe`.
-3. Place it in a folder where the application can keep its local data.
-4. Run the executable.
-
-The release executable is unsigned. Windows or antivirus software may display a reputation warning for new PyInstaller builds. Releases are built from the tagged source by the repository's GitHub Actions workflow. You can inspect the source and run it directly if preferred.
-
-### Run from source
-
-Requirements:
-
-- Windows 10 or Windows 11
-- [uv](https://docs.astral.sh/uv/)
-- Git
-- Chrome, Firefox, or Edge for browser login, unless portable Chromium is installed from the application
-
-```powershell
-git clone https://github.com/evanovar/RobloxAccountManager.git
-cd RobloxAccountManager
-uv sync --locked
-uv run python src/main.py
-```
+Switching from Evanovar RAM: copy your old `AccountManagerData/` folder next to `NightManager.exe`. The data format is the same.
 
 ## Features
 
@@ -141,7 +88,7 @@ uv run python src/main.py
 | Feature | Description |
 | :--- | :--- |
 | System tray | Hide the main window to the system tray, restore it from the tray icon, or exit from the tray menu. |
-| Windows startup | Optionally start Evanovar RAM with Windows and add a Start Menu shortcut. |
+| Windows startup | Optionally start NIGHT MANAGER with Windows and add a Start Menu shortcut. |
 | Update manager | Check GitHub releases on startup or manually, then download updates from the application. |
 | Discord webhooks | Send selected log levels, Auto-Rejoin events, optional mentions, and periodic screenshots to a configured webhook. |
 | WebSocket server | Run an optional local command server with a configurable port and encrypted password storage. Password-protected commands use `AUTH <password> | <command>`. |
@@ -162,7 +109,7 @@ uv run python src/main.py
 
 ## Data and privacy
 
-Evanovar RAM stores its persistent data in `AccountManagerData`. This includes saved accounts, settings, groups, recent games, local Roblox settings, avatar cache, and diagnostic logs.
+NIGHT MANAGER stores its persistent data in `AccountManagerData`. This includes saved accounts, settings, groups, recent games, local Roblox settings, avatar cache, and diagnostic logs.
 
 The application does not include hidden telemetry, advertising SDKs, or analytics tracking. Network communication is limited to enabled or requested functionality:
 
@@ -182,13 +129,13 @@ uv sync --locked --group build
 uv run --no-sync python scripts/build.py
 ```
 
-The executable is written to `dist/EvanovarRAM.exe`. Build configuration lives in `packaging/EvanovarRAM.spec`, and version metadata is generated during the build. Release builds also create `dist/EvanovarRAM-v<version>.exe` for GitHub Releases.
+The executable is written to `dist/NightManager.exe`. Build configuration lives in `packaging/NightManager.spec`, and version metadata is generated during the build. Release builds also create `dist/NightManager-v<version>.exe` for GitHub Releases.
 
 `src/utils/version.py` is the single source of truth for the application version. Release tags must match `APP_VERSION`.
 
 ## System changes and uninstallation
 
-Depending on enabled features, Evanovar RAM can:
+Depending on enabled features, NIGHT MANAGER can:
 
 - Create and update files under `AccountManagerData`.
 - Register or remove Windows startup and Start Menu entries.
@@ -203,20 +150,38 @@ To uninstall:
 3. Delete `AccountManagerData` to remove saved accounts, settings, and logs.
 4. Remove any startup or Start Menu entry that was enabled in the application.
 
+## Releases and automatic updates
+
+The in-app updater only installs NIGHT MANAGER builds:
+
+- It checks releases in the repository named by `UPDATE_REPOSITORY` in `src/features/updater.py` (`nighthub00/night-manager`).
+- It only downloads assets named `NightManager-v<version>.exe`.
+- Before installing, it reads the downloaded file's Windows version information and refuses anything whose product name is not `NIGHT MANAGER`. An Evanovar RAM executable is rejected even if it is uploaded to the wrong release by mistake.
+
+To publish a release, bump `APP_VERSION` in `src/utils/version.py`, commit, then push a matching tag:
+
+```powershell
+git tag v1.0.1
+git push origin v1.0.1
+```
+
+The `Release` workflow builds `NightManager-v1.0.1.exe` and attaches it to a GitHub release. Installed copies older than that version will offer the update.
+
+## Pulling fixes from Evanovar RAM
+
+The upstream project is the `upstream` git remote. Its feature code under `src/classes/` and `src/features/` is mostly unchanged here, so upstream fixes usually merge cleanly:
+
+```powershell
+git fetch upstream
+git merge upstream/main
+```
+
+Expect conflicts in `src/utils/ui.py` (the redesigned interface) and in the branding files. Keep the NIGHT MANAGER side for layout and names, and keep upstream's side for behaviour.
+
 ## Disclaimer
 
-This project is provided for educational and account management purposes. Users are responsible for complying with Roblox's Terms of Use and all applicable rules. The project maintainers are not responsible for account actions, moderation, data loss, or other consequences caused by use of the application.
-
-## Contributing
-
-Issues and pull requests are welcome. Keep changes focused, describe how they were tested, and avoid committing files from `AccountManagerData`.
-
-## Support
-
-- [Discord community](https://discord.gg/SZaZU8zwZA)
-- [Documentation](https://evanovars-roblox-account-manager.gitbook.io/evanovars-ram)
-- [GitHub issues](https://github.com/evanovar/RobloxAccountManager/issues)
+This project is not affiliated with Roblox Corporation. Using multiple accounts or automation may violate Roblox's Terms of Use. Use it at your own risk.
 
 ## License
 
-Evanovar RAM is available under the [GNU General Public License v3.0](LICENSE).
+GNU General Public License v3.0. See [LICENSE](LICENSE). Original work copyright evanovar; modifications copyright NightHub.

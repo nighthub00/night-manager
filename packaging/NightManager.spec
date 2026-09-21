@@ -16,6 +16,7 @@ if not VERSION_INFO_PATH.is_file():
 datas = [
     (str(ASSETS_ROOT / "icon.ico"), "assets"),
     (str(ASSETS_ROOT / "discordlogo.png"), "assets"),
+    (str(ASSETS_ROOT / "logo.png"), "assets"),
 ]
 binaries = []
 hiddenimports = [
@@ -55,7 +56,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="EvanovarRAM",
+    name="NightManager",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

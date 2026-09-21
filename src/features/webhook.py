@@ -21,7 +21,7 @@ from io import BytesIO
 from typing import Callable
 
 
-_APP_FOOTER = "Evanovar's Roblox Account Manager"
+_APP_FOOTER = "NIGHT MANAGER"
 _AR_EVENTS: list[tuple[str, str, int]] = [
     ("started monitoring", "Auto Rejoin Started",    0x3498DB),
     ("rejoining",          "Account Disconnected!",  0xF39C12),

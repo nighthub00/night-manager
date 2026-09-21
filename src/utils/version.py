@@ -2,4 +2,5 @@
 Application version information.
 """
 
-APP_VERSION = "2.7.1"
+APP_NAME = "NIGHT MANAGER"
+APP_VERSION = "1.0.0"

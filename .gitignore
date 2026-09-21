@@ -15,7 +15,7 @@ ENV/
 build/
 dist/
 *.spec
-!packaging/EvanovarRAM.spec
+!packaging/NightManager.spec
 *.spec.log
 
 # Account data (SENSITIVE - DO NOT COMMIT!)

@@ -1,7 +1,7 @@
 [project]
-name = "evanovar-ram"
+name = "night-manager"
 dynamic = ["version"]
-description = "A Windows desktop application for managing multiple Roblox accounts."
+description = "NIGHT MANAGER: a Windows desktop application for managing multiple Roblox accounts."
 readme = "README.md"
 requires-python = ">=3.14,<3.15"
 dependencies = [

@@ -44,11 +44,11 @@ jobs:
 
       - name: Verify build output
         run: |
-          if not exist "dist\EvanovarRAM.exe" (
+          if not exist "dist\NightManager.exe" (
             echo Build output missing.
             exit /b 1
           )
-          dir /b "dist\EvanovarRAM-v*.exe" >nul 2>&1
+          dir /b "dist\NightManager-v*.exe" >nul 2>&1
           if errorlevel 1 (
             echo Versioned release asset missing.
             exit /b 1
@@ -59,7 +59,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          name: Evanovar RAM ${{ github.event.inputs.tag || github.ref_name }}
+          name: NIGHT MANAGER ${{ github.event.inputs.tag || github.ref_name }}
           generate_release_notes: true
           fail_on_unmatched_files: true
-          files: dist/EvanovarRAM-v*.exe
+          files: dist/NightManager-v*.exe
