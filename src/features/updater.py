@@ -140,7 +140,8 @@ def _build_installer_script() -> str:
     [Parameter(Mandatory=$true)][string]$SourcePath,
     [Parameter(Mandatory=$true)][string]$DestinationPath,
     [Parameter(Mandatory=$true)][string]$LogPath,
-    [Parameter(Mandatory=$true)][string]$UpdateDirectory
+    [Parameter(Mandatory=$true)][string]$UpdateDirectory,
+    [switch]$Relaunch
 )
 
 $ErrorActionPreference = "Stop"
@@ -189,6 +190,9 @@ try {{
     Remove-Item -LiteralPath $SourcePath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $UpdateDirectory -Force -ErrorAction SilentlyContinue
+    if ($Relaunch) {{
+        Start-Process -FilePath $DestinationPath -WorkingDirectory (Split-Path -Parent $DestinationPath)
+    }}
     exit 0
 }} catch {{
     $detail = "NIGHT MANAGER automatic update failed.`r`n"
@@ -196,6 +200,10 @@ try {{
     $detail += "Destination: $DestinationPath`r`n"
     $detail += "Error: $($_.Exception.Message)"
     Write-UpdateFailure $detail
+    # Bring the current version back so a failed update never leaves the user with nothing open
+    if ($Relaunch -and (Test-Path -LiteralPath $DestinationPath -PathType Leaf)) {{
+        Start-Process -FilePath $DestinationPath -WorkingDirectory (Split-Path -Parent $DestinationPath)
+    }}
     exit 1
 }}
 '''
@@ -205,6 +213,7 @@ def _launch_installer(
     source_path: str,
     destination_path: str,
     update_directory: str,
+    relaunch: bool = False,
 ) -> None:
     script_path = os.path.join(update_directory, "install_update.ps1")
     log_path = _build_update_log_path()
@@ -231,78 +240,119 @@ def _launch_installer(
             log_path,
             "-UpdateDirectory",
             update_directory,
+            *(["-Relaunch"] if relaunch else []),
         ],
         shell=False,
         creationflags=creation_flags,
     )
 
 
+_NOT_FROZEN_MESSAGE = (
+    "Automatic updates are only available in the compiled application. "
+    "Use Manual Download when running from source."
+)
+
+
+def _download_release(on_progress: Callable[[int], None]) -> dict:
+    """Download and verify the latest release exe. Returns the staged update or raises."""
+    result = get_exe_download_url()
+    if not result:
+        raise RuntimeError(f"No {APP_NAME} executable was found in the latest release.")
+
+    url, filename = result
+    print(f"[INFO] Downloading {filename} from {url}")
+    on_progress(2)
+
+    update_directory = tempfile.mkdtemp(prefix="night_manager_update_")
+    source_path = os.path.join(update_directory, "update.exe")
+    try:
+        response = requests.get(url, stream=True, timeout=60)
+        response.raise_for_status()
+        total = int(response.headers.get("content-length", 0))
+        downloaded = 0
+
+        with open(source_path, "wb") as handle:
+            for chunk in response.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                handle.write(chunk)
+                downloaded += len(chunk)
+                if total > 0:
+                    on_progress(int(2 + (downloaded / total) * 95))
+
+        if not os.path.isfile(source_path) or os.path.getsize(source_path) == 0:
+            raise RuntimeError("The downloaded update file is empty.")
+        if total > 0 and os.path.getsize(source_path) != total:
+            raise RuntimeError("The download was cut off before it finished.")
+
+        product_name = read_product_name(source_path)
+        if product_name != APP_NAME:
+            raise RuntimeError(
+                f"The downloaded file is not a {APP_NAME} build "
+                f"(product name: {product_name or 'missing'}). The update was refused."
+            )
+    except Exception:
+        shutil.rmtree(update_directory, ignore_errors=True)
+        raise
+    return {"source": source_path, "directory": update_directory, "filename": filename}
+
+
+def install_staged_update(staged: dict, relaunch: bool) -> bool:
+    """Hand a downloaded update to the installer; it swaps the exe once this process exits."""
+    target = get_update_target()
+    if not target or not staged or not os.path.isfile(staged.get("source", "")):
+        return False
+    try:
+        _launch_installer(staged["source"], target, staged["directory"], relaunch=relaunch)
+    except Exception as exc:
+        print(f"[ERROR] Could not start the update installer: {exc}")
+        return False
+    print(f"[SUCCESS] Installing {staged.get('filename', 'update')} over {target}")
+    return True
+
+
+def discard_staged_update(staged: dict | None) -> None:
+    if staged and staged.get("directory"):
+        shutil.rmtree(staged["directory"], ignore_errors=True)
+
+
+def stage_update(on_done: Callable[[bool, str, object], None]) -> None:
+    """Download the latest release quietly in the background. on_done(ok, error, staged)."""
+    def _run():
+        if not get_update_target():
+            on_done(False, _NOT_FROZEN_MESSAGE, None)
+            return
+        try:
+            staged = _download_release(lambda _pct: None)
+        except Exception as exc:
+            print(f"[ERROR] Background update download failed: {type(exc).__name__}: {exc}")
+            on_done(False, str(exc), None)
+            return
+        on_done(True, "", staged)
+
+    threading.Thread(target=_run, daemon=True, name="UpdaterStage").start()
+
+
 def download_update(
     on_progress: Callable[[int], None],
     on_done: Callable[[bool, str], None],
+    relaunch: bool = True,
 ) -> None:
     def _run():
-        update_directory = ""
-        installer_started = False
         try:
-            target = get_update_target()
-            if not target:
-                on_done(
-                    False,
-                    "Automatic updates are only available in the compiled application. "
-                    "Use Manual Download when running from source.",
-                )
+            if not get_update_target():
+                on_done(False, _NOT_FROZEN_MESSAGE)
                 return
-
             on_progress(0)
-            result = get_exe_download_url()
-            if not result:
-                on_done(False, f"No {APP_NAME} executable was found in the latest release.")
+            staged = _download_release(on_progress)
+            if not install_staged_update(staged, relaunch=relaunch):
+                discard_staged_update(staged)
+                on_done(False, "The update installer could not be started.")
                 return
-
-            url, filename = result
-            print(f"[INFO] Downloading {filename} from {url}")
-            on_progress(2)
-
-            update_directory = tempfile.mkdtemp(prefix="night_manager_update_")
-            source_path = os.path.join(update_directory, "update.exe")
-
-            response = requests.get(url, stream=True, timeout=60)
-            response.raise_for_status()
-            total = int(response.headers.get("content-length", 0))
-            downloaded = 0
-
-            with open(source_path, "wb") as handle:
-                for chunk in response.iter_content(chunk_size=65536):
-                    if not chunk:
-                        continue
-                    handle.write(chunk)
-                    downloaded += len(chunk)
-                    if total > 0:
-                        on_progress(int(2 + (downloaded / total) * 95))
-
-            if not os.path.isfile(source_path) or os.path.getsize(source_path) == 0:
-                raise RuntimeError("The downloaded update file is empty.")
-
-            product_name = read_product_name(source_path)
-            if product_name != APP_NAME:
-                raise RuntimeError(
-                    f"The downloaded file is not a {APP_NAME} build "
-                    f"(product name: {product_name or 'missing'}). The update was refused."
-                )
-
-            _launch_installer(source_path, target, update_directory)
-            installer_started = True
             on_progress(100)
-            print(
-                f"[SUCCESS] Update downloaded. It will replace: {target}"
-            )
             on_done(True, "")
         except Exception as exc:
             print(f"[ERROR] download_update error: {type(exc).__name__}: {exc}")
             on_done(False, str(exc))
-        finally:
-            if update_directory and not installer_started:
-                shutil.rmtree(update_directory, ignore_errors=True)
 
     threading.Thread(target=_run, daemon=True, name="UpdaterDownload").start()

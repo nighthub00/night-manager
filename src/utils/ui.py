@@ -31,10 +31,10 @@ import psutil
 import requests
 
 from PySide6.QtCore import (
-    QByteArray, QEvent, QObject, QPoint, QRectF, QSize, Qt, QTimer, QUrl, Signal,
+    QByteArray, QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, QTimer, QUrl, Signal,
 )
 from PySide6.QtGui import (
-    QAction, QColor, QCursor, QFont, QIcon, QPainter, QPainterPath,
+    QAction, QColor, QCursor, QFont, QFontMetrics, QIcon, QPainter, QPainterPath,
     QImage, QImageReader, QKeySequence, QMovie, QPalette, QPixmap, QPolygon, QRegion, QTextCharFormat,
 )
 from PySide6.QtWidgets import (
@@ -46,7 +46,7 @@ from PySide6.QtWidgets import (
     QSizePolicy, QDoubleSpinBox, QSlider, QSpinBox, QStackedWidget, QSystemTrayIcon,
     QSizeGrip, QTabWidget, QTextEdit, QTreeWidget, QTreeWidgetItem,
     QToolButton, QVBoxLayout, QWidget,
-    QStyle, QStyleOptionButton,
+    QStyle, QStyleOptionButton, QStyledItemDelegate,
 )
 from PySide6.QtMultimedia import QMediaPlayer, QVideoSink
 from PySide6.QtSvg import QSvgRenderer
@@ -67,6 +67,7 @@ import features.account_actions as actions
 import features.account_creator as account_creator_mod
 import features.auto_rejoin as ar
 import features.avatars as avatars
+import features.charts as charts_mod
 import features.cookie_validator as cookie_validator_mod
 import features.chromium as chromium_mod
 import features.diagnostics as diagnostics
@@ -367,6 +368,7 @@ class _Bridge(QObject):
     update_available = Signal(str) # (latest_version) from update check worker
     update_progress = Signal(int) # (pct 0-100) from auto download worker
     update_done = Signal(bool, str) # (success, error_msg) from auto download worker
+    update_staged = Signal(object) # dict payload from the background update download
     join_place_resolved = Signal(object) # dict payload from Place ID resolution worker
     recent_game_saved = Signal() # a recent-game entry was written and needs a list refresh
     favorite_place_resolved = Signal(object) # dict payload from Save Current Game resolution
@@ -377,6 +379,8 @@ class _Bridge(QObject):
     roblox_settings_auto_applied = Signal(object) # OperationResult from Roblox settings Auto Apply
     console_wakeup = Signal()
     client_count = Signal(int) # running Roblox clients from the sidebar counter
+    charts_loaded = Signal(object) # dict payload from the Charts / game search worker
+    chart_icon_ready = Signal(str, object) # (universe_id, png_bytes) from the game icon worker
 
 
 BG = "#070A13"
@@ -430,6 +434,9 @@ _ICON_PATHS = {
     "external": '<path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
     "check": '<path d="M20 6 9 17l-5-5"/>',
     "chevron": '<path d="m6 9 6 6 6-6"/>',
+    "chart": '<path d="M3 3v18h18"/><path d="m7 15 4-4 3 3 6-6"/><path d="M15 8h5v5"/>',
+    "star": '<path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2L12 17.3 6.4 20.2l1.1-6.2L3 9.6l6.2-.9Z"/>',
+    "copy": '<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/>',
 }
 _svg_cache: dict[tuple, QPixmap] = {}
 
@@ -539,6 +546,144 @@ def _dropdown_arrow_icon_path(color: str) -> str:
 
     _dropdown_arrow_cache[color] = path
     return path
+
+
+WINDOW_EDGE = "#26335C"
+
+
+def _round_window_corners(widget: QWidget) -> None:
+    # Frameless windows get square corners on Windows 11 unless DWM is asked for the
+    # standard 8px rounding. Windows 10 rejects the attribute and keeps square corners.
+    if sys.platform != "win32":
+        return
+    try:
+        hwnd = wintypes.HWND(int(widget.winId()))
+        dwm = ctypes.windll.dwmapi
+        preference = ctypes.c_int(2) # DWMWCP_ROUND
+        dwm.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(preference), ctypes.sizeof(preference))
+        edge = QColor(WINDOW_EDGE)
+        colorref = ctypes.c_uint(edge.red() | (edge.green() << 8) | (edge.blue() << 16))
+        dwm.DwmSetWindowAttribute(hwnd, 34, ctypes.byref(colorref), ctypes.sizeof(colorref))
+    except Exception:
+        pass
+
+
+def _rounded_pixmap(data: bytes, size: int, radius: float) -> QPixmap:
+    src = QPixmap()
+    src.loadFromData(data)
+    if src.isNull():
+        return QPixmap()
+    app = QApplication.instance()
+    ratio = max(1.0, float(app.devicePixelRatio())) if app is not None else 1.0
+    pixels = round(size * ratio)
+    src = src.scaled(
+        pixels, pixels,
+        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    result = QPixmap(pixels, pixels)
+    result.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(result)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(0, 0, pixels, pixels), radius * ratio, radius * ratio)
+    painter.setClipPath(path)
+    painter.drawPixmap(0, 0, src)
+    painter.end()
+    result.setDevicePixelRatio(ratio)
+    return result
+
+
+class _ChartGameDelegate(QStyledItemDelegate):
+    # Paints one Charts row: rank, icon, name, then "playing · liked · genre".
+    ROW_HEIGHT = 58
+    ICON_SIZE = 42
+
+    def __init__(self, icon_lookup, parent=None):
+        super().__init__(parent)
+        self._icon_lookup = icon_lookup
+
+    def sizeHint(self, option, index):
+        if isinstance(index.data(Qt.ItemDataRole.UserRole), dict):
+            return QSize(0, self.ROW_HEIGHT)
+        return QSize(0, 80)
+
+    def paint(self, painter, option, index):
+        game = index.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(game, dict):
+            painter.save()
+            painter.setPen(QColor(MUTED))
+            painter.drawText(option.rect, Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, index.data())
+            painter.restore()
+            return
+
+        rank = int(index.data(Qt.ItemDataRole.UserRole + 1) or 0)
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        rect = option.rect.adjusted(0, 1, -2, -1)
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if selected or hovered:
+            bg = QPainterPath()
+            bg.addRoundedRect(QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5), 8, 8)
+            painter.fillPath(bg, QColor(ACCENT_SOFT if selected else HOVER))
+            if selected:
+                painter.setPen(QColor("#25408A"))
+                painter.drawPath(bg)
+
+        x = rect.left() + 6
+        rank_font = QFont(option.font)
+        rank_font.setPixelSize(12)
+        rank_font.setBold(True)
+        painter.setFont(rank_font)
+        if rank:
+            painter.setPen(QColor(CREAM if rank <= 3 else MUTED))
+            painter.drawText(
+                QRect(x, rect.top(), 30, rect.height()),
+                Qt.AlignmentFlag.AlignCenter, str(rank),
+            )
+            x += 34
+
+        icon_rect = QRect(x, rect.top() + (rect.height() - self.ICON_SIZE) // 2, self.ICON_SIZE, self.ICON_SIZE)
+        pix = self._icon_lookup(game["universe_id"])
+        if pix is not None and not pix.isNull():
+            painter.drawPixmap(icon_rect, pix)
+        else:
+            holder = QPainterPath()
+            holder.addRoundedRect(QRectF(icon_rect), 8, 8)
+            painter.fillPath(holder, QColor(SELECT))
+        x = icon_rect.right() + 12
+
+        text_width = max(0, rect.right() - x - 10)
+        name_font = QFont(option.font)
+        name_font.setPixelSize(13)
+        name_font.setWeight(QFont.Weight.DemiBold)
+        painter.setFont(name_font)
+        painter.setPen(QColor(TEXT))
+        name = QFontMetrics(name_font).elidedText(game["name"], Qt.TextElideMode.ElideRight, text_width)
+        painter.drawText(QRect(x, rect.top() + 9, text_width, 20), Qt.AlignmentFlag.AlignVCenter, name)
+
+        meta_font = QFont(option.font)
+        meta_font.setPixelSize(11)
+        painter.setFont(meta_font)
+        meta_top = rect.top() + 31
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(SUCCESS))
+        painter.drawEllipse(QRectF(x, meta_top + 6.5, 6, 6))
+        parts = [f"{charts_mod.format_count(game['playing'])} playing"]
+        rating = charts_mod.rating_percent(game)
+        if rating is not None:
+            parts.append(f"{rating}% liked")
+        if game.get("genre"):
+            parts.append(game["genre"])
+        meta = QFontMetrics(meta_font).elidedText(
+            "   ·   ".join(parts), Qt.TextElideMode.ElideRight, max(0, text_width - 12)
+        )
+        painter.setPen(QColor(MUTED))
+        painter.drawText(QRect(x + 12, meta_top, text_width - 12, 19), Qt.AlignmentFlag.AlignVCenter, meta)
+        painter.restore()
+
 
 class _FloatingTooltip(QWidget):
     def __init__(self, parent=None):
@@ -1448,6 +1593,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             4: "Settings",
             5: "Console",
             6: "About",
+            8: "Charts",
         }
         self._page_subtitles = {
             0: "Launch, organize and manage your Roblox accounts",
@@ -1458,6 +1604,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             5: "Live log output from every feature",
             6: f"{APP_NAME} by NightHub",
             7: "Secure your saved accounts before you start",
+            8: "Trending Roblox games: search one and join it with any account",
         }
         self._window_grid_hotkey_registered = False
         self._window_grid_hotkey_hwnd = 0
@@ -1509,6 +1656,12 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         if isinstance(sys.stdout, webhook.WebhookStdoutInterceptor):
             sys.stdout.set_console_wakeup(self._bridge.console_wakeup.emit)
         self._bridge.update_available.connect(self._on_update_available)
+        self._bridge.update_staged.connect(self._on_update_staged)
+        self._update_check_busy = False
+        self._update_staging = False
+        self._update_dialog_open = False
+        self._staged_update: dict | None = None
+        self._staged_update_installed = False
         self._bridge.join_place_resolved.connect(self._on_join_place_resolved)
         self._bridge.recent_game_saved.connect(self._refresh_recent_games)
         self._bridge.favorite_place_resolved.connect(self._on_favorite_place_resolved)
@@ -1519,6 +1672,18 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         self._bridge.roblox_settings_auto_applied.connect(
             self._on_roblox_settings_auto_applied
         )
+        self._bridge.charts_loaded.connect(self._on_charts_loaded)
+        self._bridge.chart_icon_ready.connect(self._on_chart_icon_ready)
+
+        # Charts tab
+        self._charts_sorts: list[dict] = []
+        self._charts_loaded_at = 0.0
+        self._charts_request = 0
+        self._charts_search_request = 0
+        self._charts_loading_sorts = False
+        self._charts_game: dict | None = None
+        self._charts_checked: set[str] | None = None
+        self._chart_icons: dict[str, tuple[QPixmap, QPixmap]] = {}
 
         # Account Activity Monitor
         self._presence_mod = presence_mod
@@ -1650,6 +1815,11 @@ class AccountManagerUIQt(QMainWindow): # Main Window
 
         QTimer.singleShot(2500, self._start_cookie_validator)
         QTimer.singleShot(500, self._start_update_check)
+        # People leave the manager open for days, so keep looking for releases
+        self._update_check_timer = QTimer(self)
+        self._update_check_timer.setInterval(6 * 60 * 60 * 1000)
+        self._update_check_timer.timeout.connect(self._start_update_check)
+        self._update_check_timer.start()
         if S.get("browser_type", "chrome") == "chromium":
             QTimer.singleShot(1500, self._start_chromium_status_check)
         self._background = _BackgroundController(self)
@@ -1753,10 +1923,10 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             QFrame#centerPanel {{ background: transparent; border: 0; }}
             QFrame#titleBar {{ background: transparent; border: 0; }}
             QFrame#card, QFrame#rightPanel {{
-                background: {CARD}; border: 1px solid {LINE}; border-radius: 14px;
+                background: {CARD}; border: 1px solid {LINE}; border-radius: 8px;
             }}
             QFrame#sideCard {{
-                background: {CARD}; border: 1px solid {LINE}; border-radius: 12px;
+                background: {CARD}; border: 1px solid {LINE}; border-radius: 8px;
             }}
 
             QLabel#brandName {{ color: {CREAM}; font-size: 16px; font-weight: 800; letter-spacing: 4px; }}
@@ -1811,6 +1981,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             }}
             QPushButton#primary:hover {{ background: {ACCENT_HOVER}; }}
             QPushButton#primary:pressed {{ background: {ACCENT_PRESSED}; }}
+            QPushButton#primary:disabled {{ background: {SELECT}; color: {MUTED}; }}
             QPushButton#danger {{
                 background: transparent; color: {DANGER}; border: 1px solid {DANGER_SOFT};
             }}
@@ -1850,17 +2021,32 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             }}
 
             QListWidget, QTreeWidget, QTableWidget {{
-                background: {INPUT}; border: 1px solid {LINE}; border-radius: 10px;
+                background: {INPUT}; border: 1px solid {LINE}; border-radius: 8px;
                 outline: none; padding: 4px; font-size: 12px;
             }}
             QListWidget::item {{ min-height: 26px; padding-left: 6px; border-radius: 7px; }}
             QListWidget::item:hover {{ background: {HOVER}; }}
             QListWidget::item:selected {{ background: {ACCENT_SOFT}; color: {TEXT}; }}
             QListWidget#accountList {{ background: transparent; border: 0; padding: 0; }}
-            QListWidget#accountList::item {{ margin: 1px 0; border-radius: 10px; }}
+            QListWidget#accountList::item {{ margin: 1px 0; border-radius: 8px; }}
             QListWidget#accountList::item:selected {{
                 background: {ACCENT_SOFT}; border: 1px solid #25408A;
             }}
+            QListWidget#chartList {{ background: transparent; border: 0; padding: 0; }}
+            QListWidget#chartAccounts::item {{ min-height: 30px; }}
+            QListWidget#chartAccounts::indicator {{
+                width: 16px; height: 16px; border-radius: 5px;
+                border: 1px solid #2A3868; background: {INPUT};
+            }}
+            QListWidget#chartAccounts::indicator:checked {{
+                background: {FG_ACCENT}; border: 1px solid {FG_ACCENT}; image: url({check});
+            }}
+            QFrame#chartStat {{ background: {INPUT}; border: 1px solid {LINE}; border-radius: 8px; }}
+            QLabel#chartStatValue {{ color: {TEXT}; font-size: 15px; font-weight: 700; background: transparent; }}
+            QLabel#chartStatLabel {{
+                color: {MUTED}; font-size: 10px; font-weight: 600; letter-spacing: 0.5px; background: transparent;
+            }}
+            QLabel#chartIcon {{ background: {SELECT}; border-radius: 14px; }}
             QHeaderView::section {{
                 background: {PANEL}; color: {MUTED}; border: 0;
                 border-bottom: 1px solid {LINE}; padding: 5px 8px; font-weight: 600;
@@ -1885,7 +2071,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
 
             QMenu {{
-                background: {PANEL}; border: 1px solid {LINE}; border-radius: 10px;
+                background: {PANEL}; border: 1px solid {LINE}; border-radius: 8px;
                 color: {TEXT}; font-size: 12px; padding: 6px;
             }}
             QMenu::item {{ padding: 7px 24px 7px 12px; border-radius: 6px; }}
@@ -1912,7 +2098,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
 
             QDialog {{ background: {BG}; }}
             QTextEdit, QPlainTextEdit {{
-                background: {INPUT}; border: 1px solid {LINE}; border-radius: 10px;
+                background: {INPUT}; border: 1px solid {LINE}; border-radius: 8px;
                 color: {TEXT}; font-size: 12px; padding: 4px;
             }}
 
@@ -1947,7 +2133,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
                 width: 10px; height: 10px; margin: -6px 0; border-radius: 8px;
             }}
 
-            QTabWidget::pane {{ border: 1px solid {LINE}; border-radius: 10px; top: -1px; }}
+            QTabWidget::pane {{ border: 1px solid {LINE}; border-radius: 8px; top: -1px; }}
             QTabBar::tab {{
                 background: transparent; color: {MUTED}; padding: 6px 14px;
                 border: 0; border-bottom: 2px solid transparent; font-weight: 600;
@@ -1955,7 +2141,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             QTabBar::tab:selected {{ color: {TEXT}; border-bottom: 2px solid {FG_ACCENT}; }}
 
             QGroupBox {{
-                border: 1px solid {LINE}; border-radius: 10px;
+                border: 1px solid {LINE}; border-radius: 8px;
                 margin-top: 12px; padding-top: 6px;
                 font-size: 11px; font-weight: 700; color: {MUTED};
             }}
@@ -1980,6 +2166,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             4: self._build_settings_panel,
             5: self._build_console_panel,
             6: self._build_donations_panel,
+            8: self._build_charts_panel,
         }
 
         for index, page_name in self._page_names.items():
@@ -2008,7 +2195,8 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         _setup_lay = QVBoxLayout(_setup_wrap)
         _setup_lay.setContentsMargins(10, 4, 10, 10)
         _setup_lay.addWidget(self._build_setup_panel())
-        self._page_stack.addWidget(_setup_wrap) # idx 7
+        # Page keys are stack positions, so Setup slots in at 7 ahead of the Charts host at 8
+        self._page_stack.insertWidget(7, _setup_wrap)
 
         outer.addWidget(self._build_nav_panel())
         column = QVBoxLayout()
@@ -2031,6 +2219,11 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             grip.raise_()
             grip.setVisible(not self.isMaximized())
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Re-applied on every show: toggling Always on Top recreates the native window.
+        _round_window_corners(self)
+
     def changeEvent(self, event):
         super().changeEvent(event)
         if event.type() == QEvent.Type.WindowStateChange and hasattr(self, "_max_btn"):
@@ -2051,9 +2244,15 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         self._page_subtitle_lbl.setText(self._page_subtitles.get(index, ""))
 
     def _show_page(self, index: int) -> None:
+        was_built = index in self._built_pages
         self._ensure_page_built(index)
         self._page_stack.setCurrentIndex(index)
         self._set_page_header(index)
+        nav_btn = getattr(self, "_nav_btn_by_page", {}).get(index)
+        if nav_btn is not None and not nav_btn.isChecked():
+            nav_btn.setChecked(True)
+        if index == 8 and was_built:
+            self._charts_on_shown()
         if index in self._detached_windows:
             self._show_detached_page(index)
 
@@ -2070,6 +2269,8 @@ class AccountManagerUIQt(QMainWindow): # Main Window
                     self._start_chromium_status_check()
                 elif index == 5:
                     self._drain_console_queue()
+                elif index == 8:
+                    self._charts_on_shown()
 
     def _show_page_context_menu(self, index: int, global_pos: QPoint) -> None:
         menu = QMenu(self)
@@ -2304,6 +2505,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         _NAV = [
             ("MANAGE", None, None),
             ("Accounts", "accounts", 0),
+            ("Charts", "chart", 8),
             ("Auto-Rejoin", "rejoin", 1),
             ("Anti AFK", "afk", 2),
             ("Multi Roblox", "multi", 3),
@@ -2314,6 +2516,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         ]
 
         self._normal_nav_btns: list[QPushButton] = []
+        self._nav_btn_by_page: dict[int, QPushButton] = {}
         self._nav_section_lbls: list[QLabel] = []
 
         for label, icon_name, page_idx in _NAV:
@@ -2342,6 +2545,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             )
             lay.addWidget(btn)
             self._normal_nav_btns.append(btn)
+            self._nav_btn_by_page[page_idx] = btn
 
         # Setup nav button
         self._setup_nav_btn = QPushButton("  Setup")
@@ -3536,7 +3740,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         cat_panel.setFixedWidth(150)
         cat_panel.setStyleSheet(
             f"QFrame#settingsNavSurface {{ background: {CARD}; border: 1px solid {LINE};"
-            f" border-radius: 14px; }}"
+            f" border-radius: 8px; }}"
         )
         cat_lay = QVBoxLayout(cat_panel)
         cat_lay.setContentsMargins(8, 10, 8, 10)
@@ -3708,6 +3912,15 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             actions.load_ui_settings().get("check_updates_on_startup", True)
         )
         f.addWidget(self._sett_update_chk)
+        self._sett_auto_install_chk = _chk(
+            "auto_install_updates", "Install Updates Automatically",
+            "Download new versions in the background and restart into them.\n"
+            "Turn off to get an update window with a download button instead.",
+        )
+        self._sett_auto_install_chk.setChecked(
+            actions.load_ui_settings().get("auto_install_updates", True)
+        )
+        f.addWidget(self._sett_auto_install_chk)
 
         # Start Menu shortcut
         _sm_path = os.path.join(
@@ -5281,17 +5494,134 @@ class AccountManagerUIQt(QMainWindow): # Main Window
     def _start_update_check(self) -> None:
         if not actions.load_ui_settings().get("check_updates_on_startup", True):
             return
+        if self._update_check_busy or self._update_staging or self._staged_update or self._update_dialog_open:
+            return
+        self._update_check_busy = True
+
         def _worker():
-            latest = updater_mod.check_latest_version()
-            if latest and updater_mod.is_newer(APP_VERSION, latest):
-                self._bridge.update_available.emit(latest)
+            try:
+                latest = updater_mod.check_latest_version()
+                if latest and updater_mod.is_newer(APP_VERSION, latest):
+                    self._bridge.update_available.emit(latest)
+            finally:
+                self._update_check_busy = False
+
         threading.Thread(target=_worker, daemon=True, name="UpdateCheck").start()
 
     def _on_update_available(self, latest_version: str) -> None:
-        self._show_update_dialog(latest_version)
+        auto = actions.load_ui_settings().get("auto_install_updates", True)
+        if auto and updater_mod.get_update_target():
+            if self._update_staging or self._staged_update:
+                return
+            self._update_staging = True
+            print(f"[INFO] {APP_NAME} v{latest_version} is out. Downloading it in the background.")
+            updater_mod.stage_update(
+                lambda ok, err, staged: self._bridge.update_staged.emit({
+                    "ok": ok, "error": err, "staged": staged, "version": latest_version,
+                })
+            )
+            return
+        if not self._update_dialog_open:
+            self._show_update_dialog(latest_version)
+
+    def _on_update_staged(self, payload: dict) -> None:
+        self._update_staging = False
+        if not payload.get("ok"):
+            # Fall back to the manual window so the user still hears about the release
+            if not self._update_dialog_open:
+                self._show_update_dialog(payload["version"])
+            return
+        self._staged_update = payload["staged"]
+        self._show_update_ready_notice(payload["version"])
+
+    def _show_update_ready_notice(self, version: str) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"{APP_NAME} Update")
+        dlg.setFixedWidth(400)
+        dlg.setStyleSheet(f"""
+            QDialog {{ background: {BG}; }}
+            QLabel {{ color: {TEXT}; background: transparent; }}
+            QPushButton {{
+                background: {INPUT}; color: {TEXT}; border: 1px solid {LINE};
+                border-radius: 8px; padding: 6px 14px; font-size: 12px;
+            }}
+            QPushButton:hover {{ background: {SELECT}; border-color: #26335C; }}
+        """)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(22, 18, 22, 18)
+        lay.setSpacing(10)
+        hdr = QLabel(f"{APP_NAME} v{version} is ready")
+        hdr.setStyleSheet(f"font-size: 15px; font-weight: 700; color: {CREAM};")
+        lay.addWidget(hdr)
+        info = QLabel()
+        info.setWordWrap(True)
+        info.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
+        lay.addWidget(info)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        restart_btn = QPushButton("Restart now")
+        restart_btn.setStyleSheet(_primary_button_style())
+        restart_btn.setFixedHeight(34)
+        later_btn = QPushButton("Later")
+        later_btn.setFixedHeight(34)
+        row.addWidget(restart_btn, 1)
+        row.addWidget(later_btn)
+        lay.addLayout(row)
+
+        # Restarting stops Auto-Rejoin, so only count down when nothing would be interrupted
+        busy = bool(self._ar_workers)
+        remaining = [0 if busy else 15]
+        countdown = QTimer(dlg)
+        countdown.setInterval(1000)
+
+        def _render():
+            if remaining[0] > 0:
+                info.setText(f"Downloaded in the background. Restarting in {remaining[0]}s to finish updating.")
+            else:
+                info.setText(
+                    "Downloaded in the background. Restart whenever you like; "
+                    f"otherwise it installs the next time you close {APP_NAME}."
+                )
+
+        def _tick():
+            remaining[0] -= 1
+            if remaining[0] <= 0:
+                countdown.stop()
+                dlg.accept()
+                self._restart_for_update()
+                return
+            _render()
+
+        def _later():
+            countdown.stop()
+            dlg.accept()
+            print(f"[INFO] v{version} will install when {APP_NAME} closes.")
+
+        countdown.timeout.connect(_tick)
+        restart_btn.clicked.connect(lambda: (countdown.stop(), dlg.accept(), self._restart_for_update()))
+        later_btn.clicked.connect(_later)
+        _render()
+        if remaining[0] > 0:
+            countdown.start()
+        dlg.show()
+        dlg.raise_()
+
+    def _restart_for_update(self) -> None:
+        if self._staged_update_installed:
+            return
+        if updater_mod.install_staged_update(self._staged_update, relaunch=True):
+            self._staged_update_installed = True
+            self._quit_for_update()
+        else:
+            _show_error(self, "Update", "The update could not be installed. It will be retried next launch.")
+            updater_mod.discard_staged_update(self._staged_update)
+            self._staged_update = None
 
     def _show_update_dialog(self, latest_version: str) -> None:
+        self._update_dialog_open = True
         dlg = QDialog(self)
+        dlg.finished.connect(lambda _code: setattr(self, "_update_dialog_open", False))
         dlg.setWindowTitle(f"{APP_NAME} Update")
         dlg.setFixedSize(440, 290)
         dlg.setStyleSheet(f"""
@@ -5317,7 +5647,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
 
         # Version Info Card
         card = QFrame()
-        card.setStyleSheet(f"QFrame {{ background: {CARD}; border: 1px solid {LINE}; border-radius: 10px; }}")
+        card.setStyleSheet(f"QFrame {{ background: {CARD}; border: 1px solid {LINE}; border-radius: 8px; }}")
         card_lay = QVBoxLayout(card)
         card_lay.setContentsMargins(14, 10, 14, 10)
         card_lay.setSpacing(4)
@@ -6595,6 +6925,11 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             self._stop_headless_manager()
         except Exception as e:
             print(f"[ERROR] Failed to restore Roblox windows: {e}")
+        # An update downloaded earlier and postponed with Later goes in now
+        if self._staged_update and not self._staged_update_installed:
+            self._staged_update_installed = updater_mod.install_staged_update(
+                self._staged_update, relaunch=False,
+            )
         self._disable_system_tray()
 
     def closeEvent(self, event):
@@ -7630,6 +7965,499 @@ class AccountManagerUIQt(QMainWindow): # Main Window
 
         threading.Thread(target=_save_recent_worker, daemon=True, name="save-recent-game").start()
 
+    # Charts tab
+    def _build_charts_panel(self) -> QWidget:
+        page = QWidget()
+        page_lay = QHBoxLayout(page)
+        page_lay.setContentsMargins(10, 4, 10, 10)
+        page_lay.setSpacing(14)
+
+        card = QFrame()
+        card.setObjectName("card")
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(10)
+
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        self._chart_title_lbl = QLabel("Top Trending")
+        self._chart_title_lbl.setObjectName("sectionTitle")
+        header.addWidget(self._chart_title_lbl)
+        self._chart_count_lbl = QLabel("0")
+        self._chart_count_lbl.setObjectName("countChip")
+        header.addWidget(self._chart_count_lbl)
+        header.addStretch(1)
+        self._chart_status_lbl = QLabel("")
+        self._chart_status_lbl.setObjectName("fieldLabel")
+        header.addWidget(self._chart_status_lbl)
+        lay.addLayout(header)
+
+        controls = QHBoxLayout()
+        controls.setSpacing(8)
+        self._chart_sort_combo = QComboBox()
+        self._chart_sort_combo.setMinimumWidth(210)
+        self._chart_sort_combo.setToolTip("Which Roblox chart to show")
+        self._chart_sort_combo.currentIndexChanged.connect(self._on_chart_sort_changed)
+        controls.addWidget(self._chart_sort_combo)
+
+        self._chart_search = QLineEdit()
+        self._chart_search.setObjectName("searchField")
+        self._chart_search.setPlaceholderText("Search games or paste a Place ID")
+        self._chart_search.setToolTip("Type a game name, or paste a Place ID or a roblox.com/games link")
+        self._chart_search.setClearButtonEnabled(True)
+        self._chart_search.addAction(_svg_icon("search", MUTED), QLineEdit.ActionPosition.LeadingPosition)
+        self._chart_search.textChanged.connect(lambda _text: self._chart_search_timer.start())
+        self._chart_search.returnPressed.connect(self._run_chart_search)
+        controls.addWidget(self._chart_search, 1)
+
+        refresh_btn = QPushButton()
+        refresh_btn.setObjectName("ghost")
+        refresh_btn.setIcon(_svg_icon("refresh", MUTED, size=14))
+        refresh_btn.setFixedWidth(36)
+        refresh_btn.setToolTip("Reload from Roblox")
+        refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        refresh_btn.clicked.connect(self._on_chart_refresh)
+        controls.addWidget(refresh_btn)
+        lay.addLayout(controls)
+
+        self._chart_search_timer = QTimer(self)
+        self._chart_search_timer.setSingleShot(True)
+        self._chart_search_timer.setInterval(450)
+        self._chart_search_timer.timeout.connect(self._run_chart_search)
+        self._chart_repaint_timer = QTimer(self)
+        self._chart_repaint_timer.setSingleShot(True)
+        self._chart_repaint_timer.setInterval(60)
+        self._chart_repaint_timer.timeout.connect(lambda: self._chart_list.viewport().update())
+
+        self._chart_list = QListWidget()
+        self._chart_list.setObjectName("chartList")
+        self._chart_list.setItemDelegate(_ChartGameDelegate(self._chart_small_icon, self._chart_list))
+        self._chart_list.setMouseTracking(True)
+        self._chart_list.viewport().setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self._chart_list.setUniformItemSizes(True)
+        self._chart_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self._chart_list.verticalScrollBar().setSingleStep(18)
+        self._chart_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._chart_list.customContextMenuRequested.connect(self._on_chart_context_menu)
+        self._chart_list.currentItemChanged.connect(self._on_chart_item_changed)
+        self._chart_list.itemDoubleClicked.connect(lambda _item: self._on_charts_join())
+        lay.addWidget(self._chart_list, 1)
+        page_lay.addWidget(card, 1)
+        page_lay.addWidget(self._build_chart_side_panel())
+        self._update_chart_detail()
+        return page
+
+    def _build_chart_side_panel(self) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("rightPanel")
+        panel.setFixedWidth(300)
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(8)
+
+        title = QLabel("Selected game")
+        title.setObjectName("sectionTitle")
+        lay.addWidget(title)
+
+        head = QHBoxLayout()
+        head.setSpacing(12)
+        self._chart_icon_lbl = QLabel()
+        self._chart_icon_lbl.setObjectName("chartIcon")
+        self._chart_icon_lbl.setFixedSize(72, 72)
+        head.addWidget(self._chart_icon_lbl, 0, Qt.AlignmentFlag.AlignTop)
+        names = QVBoxLayout()
+        names.setSpacing(3)
+        self._chart_name_lbl = QLabel()
+        self._chart_name_lbl.setObjectName("gameName")
+        self._chart_name_lbl.setWordWrap(True)
+        self._chart_name_lbl.setStyleSheet("font-size: 13px;")
+        names.addWidget(self._chart_name_lbl)
+        self._chart_meta_lbl = QLabel()
+        self._chart_meta_lbl.setObjectName("fieldLabel")
+        self._chart_meta_lbl.setWordWrap(True)
+        names.addWidget(self._chart_meta_lbl)
+        names.addStretch(1)
+        head.addLayout(names, 1)
+        lay.addLayout(head)
+
+        stats = QHBoxLayout()
+        stats.setSpacing(8)
+        self._chart_stat_values: dict[str, QLabel] = {}
+        for key, caption in (("playing", "PLAYING"), ("rating", "LIKED")):
+            cell = QFrame()
+            cell.setObjectName("chartStat")
+            cell_lay = QVBoxLayout(cell)
+            cell_lay.setContentsMargins(12, 7, 12, 7)
+            cell_lay.setSpacing(0)
+            value = QLabel("-")
+            value.setObjectName("chartStatValue")
+            label = QLabel(caption)
+            label.setObjectName("chartStatLabel")
+            cell_lay.addWidget(value)
+            cell_lay.addWidget(label)
+            stats.addWidget(cell, 1)
+            self._chart_stat_values[key] = value
+        lay.addLayout(stats)
+
+        place_row = QHBoxLayout()
+        place_row.setSpacing(6)
+        self._chart_place_lbl = QLabel()
+        self._chart_place_lbl.setObjectName("fieldLabel")
+        self._chart_place_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        place_row.addWidget(self._chart_place_lbl, 1)
+        self._chart_copy_btn = QPushButton()
+        self._chart_copy_btn.setObjectName("ghost")
+        self._chart_copy_btn.setIcon(_svg_icon("copy", MUTED, size=13))
+        self._chart_copy_btn.setFixedSize(30, 26)
+        self._chart_copy_btn.setStyleSheet("min-height: 24px; padding: 0;")
+        self._chart_copy_btn.setToolTip("Copy Place ID")
+        self._chart_copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._chart_copy_btn.clicked.connect(self._on_chart_copy_place_id)
+        place_row.addWidget(self._chart_copy_btn)
+        lay.addLayout(place_row)
+
+        lay.addSpacing(4)
+        accounts_header = QHBoxLayout()
+        accounts_header.setSpacing(10)
+        accounts_lbl = QLabel("Join with")
+        accounts_lbl.setObjectName("fieldLabel")
+        accounts_header.addWidget(accounts_lbl)
+        accounts_header.addStretch(1)
+        for text, checked in (("All", True), ("None", False)):
+            link = QPushButton(text)
+            link.setObjectName("linkButton")
+            link.setCursor(Qt.CursorShape.PointingHandCursor)
+            link.clicked.connect(lambda _=False, c=checked: self._set_all_chart_accounts(c))
+            accounts_header.addWidget(link)
+        lay.addLayout(accounts_header)
+
+        self._chart_accounts = QListWidget()
+        self._chart_accounts.setObjectName("chartAccounts")
+        self._chart_accounts.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self._chart_accounts.setIconSize(QSize(20, 20))
+        self._chart_accounts.setMinimumHeight(90)
+        self._chart_accounts.itemClicked.connect(self._on_chart_account_clicked)
+        lay.addWidget(self._chart_accounts, 1)
+
+        self._chart_join_btn = QPushButton("  Join Game")
+        self._chart_join_btn.setObjectName("primary")
+        self._chart_join_btn.setIcon(_svg_icon("play", "#FFFFFF", size=14))
+        self._chart_join_btn.setMinimumHeight(36)
+        self._chart_join_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._chart_join_btn.clicked.connect(self._on_charts_join)
+        lay.addWidget(self._chart_join_btn)
+
+        quick = QHBoxLayout()
+        quick.setSpacing(6)
+        self._chart_action_btns: list[QPushButton] = []
+        for label, icon_name, tip, slot in (
+            ("Launch", "accounts", "Put this game in the Accounts page's Launch panel", self._on_chart_use_in_launch),
+            ("Favorite", "star", "Save this game to the Place ID favorites", self._on_chart_add_favorite),
+            ("Roblox", "external", "Open the game page on roblox.com", self._on_chart_open_web),
+        ):
+            btn = QPushButton(f" {label}")
+            btn.setObjectName("ghost")
+            btn.setIcon(_svg_icon(icon_name, MUTED, size=14))
+            btn.setToolTip(tip)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(slot)
+            quick.addWidget(btn, 1)
+            self._chart_action_btns.append(btn)
+        lay.addLayout(quick)
+        return panel
+
+    def _charts_on_shown(self) -> None:
+        self._charts_refresh_accounts()
+        stale = time.time() - self._charts_loaded_at > 5 * 60
+        if (not self._charts_sorts or stale) and not self._charts_loading_sorts:
+            self._charts_load()
+
+    def _charts_load(self, force: bool = False) -> None:
+        self._charts_request += 1
+        request = self._charts_request
+        self._charts_loading_sorts = True
+        self._chart_status_lbl.setText("Loading charts...")
+
+        def _worker():
+            result = charts_mod.fetch_sorts(force=force)
+            self._bridge.charts_loaded.emit({"request": request, "kind": "sorts", "result": result})
+
+        threading.Thread(target=_worker, daemon=True, name="charts-load").start()
+
+    def _run_chart_search(self) -> None:
+        self._chart_search_timer.stop()
+        self._charts_search_request += 1
+        request = self._charts_search_request
+        query = self._chart_search.text().strip()
+        if not query:
+            self._chart_status_lbl.setText("")
+            self._show_current_chart()
+            return
+        self._chart_status_lbl.setText("Searching...")
+
+        def _worker():
+            result = charts_mod.search_games(query)
+            self._bridge.charts_loaded.emit({
+                "request": request, "kind": "search", "query": query, "result": result,
+            })
+
+        threading.Thread(target=_worker, daemon=True, name="charts-search").start()
+
+    def _on_charts_loaded(self, payload: dict) -> None:
+        if payload.get("kind") == "sorts":
+            if payload.get("request") != self._charts_request:
+                return
+            self._charts_loading_sorts = False
+        elif payload.get("request") != self._charts_search_request:
+            return
+        result: OperationResult = payload["result"]
+        if not result:
+            self._chart_status_lbl.setText("")
+            print(f"[Charts] {result.message} {result.detail}".strip())
+            if payload["kind"] == "sorts" and self._charts_sorts:
+                self._chart_status_lbl.setText("Showing the last loaded charts")
+                return
+            self._show_chart_games([], result.message)
+            return
+
+        self._chart_status_lbl.setText("")
+        if payload["kind"] == "search":
+            self._chart_title_lbl.setText(f'Results for "{payload["query"]}"')
+            self._show_chart_games(result.data, "No games matched that search.", ranked=False)
+            return
+
+        self._charts_sorts = result.data
+        self._charts_loaded_at = time.time()
+        wanted = self._chart_sort_combo.currentData() or actions.get_ui_setting("charts_last_sort", "top-trending")
+        self._chart_sort_combo.blockSignals(True)
+        self._chart_sort_combo.clear()
+        for sort in self._charts_sorts:
+            self._chart_sort_combo.addItem(sort["name"], sort["id"])
+        found = self._chart_sort_combo.findData(wanted)
+        self._chart_sort_combo.setCurrentIndex(max(0, found))
+        self._chart_sort_combo.blockSignals(False)
+        if not self._chart_search.text().strip():
+            self._show_current_chart()
+
+    def _show_current_chart(self) -> None:
+        sort_id = self._chart_sort_combo.currentData()
+        sort = next((s for s in self._charts_sorts if s["id"] == sort_id), None)
+        if sort is None:
+            if not getattr(self, "_charts_loading_sorts", False):
+                self._chart_title_lbl.setText("Charts")
+                self._show_chart_games([], "Charts are not loaded yet. Press Refresh.")
+            return
+        self._chart_title_lbl.setText(sort["name"])
+        self._show_chart_games(sort["games"], "This chart is empty right now.")
+
+    def _on_chart_sort_changed(self, _index: int) -> None:
+        sort_id = self._chart_sort_combo.currentData()
+        if sort_id:
+            actions.save_ui_setting("charts_last_sort", sort_id)
+        if self._chart_search.text():
+            self._chart_search.blockSignals(True)
+            self._chart_search.clear()
+            self._chart_search.blockSignals(False)
+            self._chart_search_timer.stop()
+            self._charts_search_request += 1 # drop any search still in flight
+            self._chart_status_lbl.setText("")
+        self._show_current_chart()
+
+    def _on_chart_refresh(self) -> None:
+        if self._chart_search.text().strip():
+            self._run_chart_search()
+        else:
+            self._charts_load(force=True)
+
+    def _show_chart_games(self, games: list[dict], empty_text: str, ranked: bool = True) -> None:
+        games = [g for g in games if not g.get("sponsored")]
+        selected_id = self._charts_game["universe_id"] if self._charts_game else None
+        self._chart_list.blockSignals(True)
+        self._chart_list.clear()
+        self._chart_count_lbl.setText(str(len(games)))
+        if not games:
+            item = QListWidgetItem(empty_text)
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self._chart_list.addItem(item)
+        for rank, game in enumerate(games, 1):
+            item = QListWidgetItem(game["name"])
+            item.setData(Qt.ItemDataRole.UserRole, game)
+            item.setData(Qt.ItemDataRole.UserRole + 1, rank if ranked else 0)
+            item.setToolTip(f"{game['name']}\nPlace ID {game['place_id']}\nDouble-click to join")
+            self._chart_list.addItem(item)
+            if game["universe_id"] == selected_id:
+                self._chart_list.setCurrentItem(item)
+        self._chart_list.blockSignals(False)
+        self._chart_list.scrollToTop()
+        missing = [g["universe_id"] for g in games if g["universe_id"] not in self._chart_icons]
+        if missing:
+            charts_mod.fetch_icons_async(missing, self._bridge.chart_icon_ready.emit)
+
+    def _chart_small_icon(self, universe_id: str) -> QPixmap | None:
+        icons = self._chart_icons.get(universe_id)
+        return icons[0] if icons else None
+
+    def _on_chart_icon_ready(self, universe_id: str, data: bytes) -> None:
+        small = _rounded_pixmap(data, _ChartGameDelegate.ICON_SIZE, 9)
+        if small.isNull():
+            return
+        self._chart_icons[universe_id] = (small, _rounded_pixmap(data, 72, 14))
+        self._chart_repaint_timer.start()
+        if self._charts_game and self._charts_game["universe_id"] == universe_id:
+            self._update_chart_detail()
+
+    def _on_chart_item_changed(self, current: QListWidgetItem | None, _previous=None) -> None:
+        game = current.data(Qt.ItemDataRole.UserRole) if current is not None else None
+        if isinstance(game, dict):
+            self._charts_game = game
+            self._update_chart_detail()
+
+    def _update_chart_detail(self) -> None:
+        game = self._charts_game
+        enabled = game is not None
+        self._chart_copy_btn.setEnabled(enabled)
+        for btn in self._chart_action_btns:
+            btn.setEnabled(enabled)
+        self._update_chart_join_button()
+        if game is None:
+            self._chart_icon_lbl.clear()
+            self._chart_name_lbl.setText("No game selected")
+            self._chart_meta_lbl.setText("Pick a game from the chart or search for one.")
+            for value in self._chart_stat_values.values():
+                value.setText("-")
+            self._chart_place_lbl.setText("")
+            return
+        icons = self._chart_icons.get(game["universe_id"])
+        if icons:
+            self._chart_icon_lbl.setPixmap(icons[1])
+        else:
+            self._chart_icon_lbl.clear()
+        self._chart_name_lbl.setText(game["name"])
+        self._chart_meta_lbl.setText("  ·  ".join(p for p in (game.get("genre"), game.get("maturity")) if p))
+        self._chart_stat_values["playing"].setText(charts_mod.format_count(game["playing"]))
+        rating = charts_mod.rating_percent(game)
+        self._chart_stat_values["rating"].setText(f"{rating}%" if rating is not None else "-")
+        self._chart_place_lbl.setText(f"Place ID  {game['place_id']}")
+
+    def _charts_refresh_accounts(self) -> None:
+        if not hasattr(self, "_chart_accounts"):
+            return
+        usernames = list(self.manager.accounts.keys())
+        if self._charts_checked is None:
+            self._charts_checked = set(self._get_selected_usernames())
+        self._charts_checked &= set(usernames)
+        self._chart_accounts.clear()
+        if not usernames:
+            item = QListWidgetItem("No accounts yet")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self._chart_accounts.addItem(item)
+        for username in usernames:
+            item = QListWidgetItem(f" {username}")
+            item.setData(Qt.ItemDataRole.UserRole, username)
+            # Not user-checkable on purpose: a click anywhere on the row toggles it once
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            item.setCheckState(
+                Qt.CheckState.Checked if username in self._charts_checked else Qt.CheckState.Unchecked
+            )
+            data = self.manager.accounts.get(username)
+            user_id = str(data.get("user_id") or "") if isinstance(data, dict) else ""
+            avatar = avatars.load_cached_bytes(user_id) if user_id and user_id != "0" else None
+            pix = self._make_circular_pixmap(avatar, 20) if avatar else QPixmap()
+            item.setIcon(QIcon(pix if not pix.isNull() else self._make_placeholder_pixmap(20)))
+            self._chart_accounts.addItem(item)
+        self._update_chart_join_button()
+
+    def _on_chart_account_clicked(self, item: QListWidgetItem) -> None:
+        username = item.data(Qt.ItemDataRole.UserRole)
+        if not username:
+            return
+        checked = item.checkState() != Qt.CheckState.Checked
+        item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        if checked:
+            self._charts_checked.add(username)
+        else:
+            self._charts_checked.discard(username)
+        self._update_chart_join_button()
+
+    def _set_all_chart_accounts(self, checked: bool) -> None:
+        self._charts_checked = set(self.manager.accounts.keys()) if checked else set()
+        self._charts_refresh_accounts()
+
+    def _chart_checked_usernames(self) -> list[str]:
+        checked = self._charts_checked or set()
+        return [u for u in self.manager.accounts.keys() if u in checked]
+
+    def _update_chart_join_button(self) -> None:
+        if not hasattr(self, "_chart_join_btn"):
+            return
+        count = len(self._chart_checked_usernames())
+        if count > 1:
+            text = f"  Join with {count} accounts"
+        elif count == 1:
+            text = "  Join with 1 account"
+        else:
+            text = "  Join Game"
+        self._chart_join_btn.setText(text)
+        self._chart_join_btn.setEnabled(self._charts_game is not None)
+
+    def _on_charts_join(self) -> None:
+        game = self._charts_game
+        if game is None:
+            return
+        usernames = self._chart_checked_usernames()
+        if not usernames:
+            _show_error(self, "No accounts ticked", "Tick at least one account under Join with.")
+            return
+        if not self._guard_invalid(usernames):
+            return
+        if not self._confirm_launch(f"Join {game['name']}", usernames):
+            return
+        self._dispatch_join_place(usernames, game["place_id"], "", game["place_id"])
+
+    def _on_chart_context_menu(self, pos: QPoint) -> None:
+        item = self._chart_list.itemAt(pos)
+        if item is None or not isinstance(item.data(Qt.ItemDataRole.UserRole), dict):
+            return
+        self._chart_list.setCurrentItem(item)
+        menu = QMenu(self)
+        menu.addAction("Join", self._on_charts_join)
+        menu.addAction("Use in Launch panel", self._on_chart_use_in_launch)
+        menu.addSeparator()
+        menu.addAction("Copy Place ID", self._on_chart_copy_place_id)
+        menu.addAction("Add to favorites", self._on_chart_add_favorite)
+        menu.addAction("Open on Roblox", self._on_chart_open_web)
+        menu.exec(self._chart_list.viewport().mapToGlobal(pos))
+
+    def _on_chart_use_in_launch(self) -> None:
+        if self._charts_game is None:
+            return
+        # A private link from another game would send the join to the wrong server
+        self._private_server_edit.setCurrentText("")
+        self._place_id_edit.setCurrentText(self._charts_game["place_id"])
+        self._show_page(0)
+
+    def _on_chart_copy_place_id(self) -> None:
+        if self._charts_game is not None:
+            QApplication.clipboard().setText(self._charts_game["place_id"])
+            self._chart_status_lbl.setText("Place ID copied")
+
+    def _on_chart_add_favorite(self) -> None:
+        game = self._charts_game
+        if game is None:
+            return
+        try:
+            favorites_mod.add_favorite(game["place_id"], game["name"])
+        except OSError as exc:
+            _show_error(self, "Favorites", f"Could not save the favorite: {exc}")
+            return
+        self._refresh_favorites_dropdown()
+        self._chart_status_lbl.setText("Saved to favorites")
+        print(f"[INFO] Added {game['name']} ({game['place_id']}) to favorites")
+
+    def _on_chart_open_web(self) -> None:
+        if self._charts_game is not None:
+            webbrowser.open(f"https://www.roblox.com/games/{self._charts_game['place_id']}")
+
     def _on_join_user(self):
         usernames = self._get_selected_usernames()
         if not usernames:
@@ -8166,7 +8994,7 @@ _DLG_STYLE = f"""
     QLineEdit {{ background: {INPUT}; border: 1px solid {LINE}; border-radius: 8px;
                 color: {TEXT}; padding: 5px 10px; min-height: 22px; }}
     QLineEdit:focus {{ border-color: {FG_ACCENT}; }}
-    QTextEdit {{ background: {INPUT}; border: 1px solid {LINE}; border-radius: 10px;
+    QTextEdit {{ background: {INPUT}; border: 1px solid {LINE}; border-radius: 8px;
                 color: {TEXT}; font-family: Consolas, monospace; font-size: 11px; }}
     QPushButton {{
         background: {INPUT}; border: 1px solid {LINE}; border-radius: 8px;
