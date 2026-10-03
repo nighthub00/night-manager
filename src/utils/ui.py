@@ -5569,9 +5569,9 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         row.addWidget(later_btn)
         lay.addLayout(row)
 
-        # Restarting stops Auto-Rejoin, so only count down when nothing would be interrupted
-        busy = bool(self._ar_workers)
-        remaining = [0 if busy else 15]
+        # Only count down when an unattended restart would interrupt nothing
+        hold_reason = self._update_restart_hold_reason()
+        remaining = [0 if hold_reason else 15]
         countdown = QTimer(dlg)
         countdown.setInterval(1000)
 
@@ -5579,8 +5579,9 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             if remaining[0] > 0:
                 info.setText(f"Downloaded in the background. Restarting in {remaining[0]}s to finish updating.")
             else:
+                prefix = f"No automatic restart: {hold_reason}. " if hold_reason else ""
                 info.setText(
-                    "Downloaded in the background. Restart whenever you like; "
+                    f"Downloaded in the background. {prefix}Restart whenever you like; "
                     f"otherwise it installs the next time you close {APP_NAME}."
                 )
 
@@ -5606,6 +5607,21 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             countdown.start()
         dlg.show()
         dlg.raise_()
+
+    def _update_restart_hold_reason(self) -> str:
+        """Why the update must wait for the user instead of restarting on a timer ("" = safe)."""
+        if self._ar_workers:
+            return "Auto-Rejoin is running"
+        if getattr(self, "_afk_enabled", False):
+            return "Anti-AFK is on"
+        try:
+            password_locked = self.manager.get_encryption_method() == "password"
+        except Exception:
+            password_locked = False
+        if password_locked:
+            # A restart would stop at the password prompt until someone types it
+            return "your password is needed to reopen"
+        return ""
 
     def _restart_for_update(self) -> None:
         if self._staged_update_installed:
