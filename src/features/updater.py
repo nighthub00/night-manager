@@ -15,9 +15,10 @@ import threading
 import time
 from typing import Callable
 
+import psutil
 import requests
 
-from utils.app_paths import get_data_dir
+from utils.app_paths import get_clean_child_env, get_data_dir
 from utils.version import APP_NAME
 
 # Updates come only from NIGHT MANAGER's own releases. Pointing this at the
@@ -137,6 +138,7 @@ def _build_update_log_path() -> str:
 def _build_installer_script() -> str:
     return f'''param(
     [Parameter(Mandatory=$true)][int]$TargetProcessId,
+    [int]$LauncherProcessId = 0,
     [Parameter(Mandatory=$true)][string]$SourcePath,
     [Parameter(Mandatory=$true)][string]$DestinationPath,
     [Parameter(Mandatory=$true)][string]$LogPath,
@@ -157,7 +159,8 @@ function Write-UpdateFailure([string]$Message) {{
 
 try {{
     $exitDeadline = [DateTime]::UtcNow.AddSeconds({PROCESS_WAIT_SECONDS})
-    while (Get-Process -Id $TargetProcessId -ErrorAction SilentlyContinue) {{
+    while ((Get-Process -Id $TargetProcessId -ErrorAction SilentlyContinue) -or
+           ($LauncherProcessId -and (Get-Process -Id $LauncherProcessId -ErrorAction SilentlyContinue))) {{
         if ([DateTime]::UtcNow -ge $exitDeadline) {{
             throw "The running application did not exit within {PROCESS_WAIT_SECONDS} seconds."
         }}
@@ -209,6 +212,18 @@ try {{
 '''
 
 
+def _onefile_launcher_pid() -> int:
+    # A onefile build runs as two processes; the outer bootloader keeps the exe
+    # open until it has cleaned up after this one, so the installer waits for both.
+    try:
+        parent = psutil.Process(os.getpid()).parent()
+        if parent is not None and os.path.normcase(parent.exe()) == os.path.normcase(sys.executable):
+            return parent.pid
+    except Exception:
+        pass
+    return 0
+
+
 def _launch_installer(
     source_path: str,
     destination_path: str,
@@ -232,6 +247,8 @@ def _launch_installer(
             script_path,
             "-TargetProcessId",
             str(os.getpid()),
+            "-LauncherProcessId",
+            str(_onefile_launcher_pid()),
             "-SourcePath",
             source_path,
             "-DestinationPath",
@@ -244,6 +261,7 @@ def _launch_installer(
         ],
         shell=False,
         creationflags=creation_flags,
+        env=get_clean_child_env(), # the script relaunches NightManager.exe
     )
 
 

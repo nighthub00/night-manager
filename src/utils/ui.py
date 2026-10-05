@@ -20,7 +20,7 @@ import time
 import webbrowser
 import weakref
 
-from utils.app_paths import get_app_dir, get_data_dir, get_resource_path
+from utils.app_paths import get_app_dir, get_clean_child_env, get_data_dir, get_resource_path
 from utils.version import APP_NAME, APP_VERSION
 
 _ROOT_DIR = get_app_dir()
@@ -3887,6 +3887,8 @@ class AccountManagerUIQt(QMainWindow): # Main Window
                 else:
                     executable = sys.executable
                     params = " ".join(f'"{a}"' for a in sys.argv)
+                os.environ.clear() # the relaunched exe must not inherit this onefile run's _PYI_* state
+                os.environ.update(get_clean_child_env())
                 ctypes.windll.shell32.ShellExecuteW(None, "runas", executable, params, None, 1)
                 QApplication.quit()
             except Exception as e:
