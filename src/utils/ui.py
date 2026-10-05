@@ -31,11 +31,13 @@ import psutil
 import requests
 
 from PySide6.QtCore import (
-    QByteArray, QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, QTimer, QUrl, Signal,
+    QByteArray, QEasingCurve, QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, QTimer, QUrl,
+    QVariantAnimation, Signal,
 )
 from PySide6.QtGui import (
     QAction, QColor, QCursor, QFont, QFontMetrics, QIcon, QPainter, QPainterPath,
-    QImage, QImageReader, QKeySequence, QMovie, QPalette, QPixmap, QPolygon, QRegion, QTextCharFormat,
+    QImage, QImageReader, QKeySequence, QMovie, QPalette, QPixmap, QPolygon, QRegion, QShortcut,
+    QTextCharFormat,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox,
@@ -112,8 +114,7 @@ class _DragDropFilter(QObject):
         self._float_win: QFrame | None = None # floating window with username + avatar
         self._viewport = list_widget.viewport() # avoid calling viewport() on a deleted C++ object at teardown
 
-        self._indicator = QFrame(self._viewport)
-        self._indicator.setFixedHeight(2)
+        self._indicator = QFrame(self._viewport) # a 2px bar: horizontal in a list, vertical in a grid
         self._indicator.setStyleSheet(f"background: {FG_ACCENT}; border: none;")
         self._indicator.hide()
         self.enabled = True
@@ -264,11 +265,18 @@ class _DragDropFilter(QObject):
         if count == 0:
             return 0
 
+        grid = self._list.isWrapping()
         for row in range(count):
             item = self._list.item(row)
             if item is None:
                 continue
             rect = self._list.visualItemRect(item)
+            if grid:
+                # reading order: any earlier line, or the left half of a tile on this line
+                if local_pos.y() < rect.top() or (local_pos.y() <= rect.bottom()
+                                                  and local_pos.x() < rect.center().x()):
+                    return row
+                continue
             mid = rect.top() + rect.height() // 2
             if local_pos.y() < mid:
                 return row
@@ -279,6 +287,18 @@ class _DragDropFilter(QObject):
         count = self._list.count()
         if count == 0:
             self._indicator.hide()
+            return
+
+        if self._list.isWrapping():
+            if insert_before >= count:
+                rect = self._list.visualItemRect(self._list.item(count - 1))
+                x = rect.right() + 2
+            else:
+                rect = self._list.visualItemRect(self._list.item(max(0, insert_before)))
+                x = rect.left() - 2
+            self._indicator.setGeometry(x - 1, rect.top(), 2, rect.height())
+            self._indicator.raise_()
+            self._indicator.show()
             return
 
         if insert_before <= 0:
@@ -434,6 +454,8 @@ _ICON_PATHS = {
     "external": '<path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
     "check": '<path d="M20 6 9 17l-5-5"/>',
     "chevron": '<path d="m6 9 6 6 6-6"/>',
+    "panel-close": '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/><path d="m16 15-3-3 3-3"/>',
+    "panel-open": '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/><path d="m14 9 3 3-3 3"/>',
     "chart": '<path d="M3 3v18h18"/><path d="m7 15 4-4 3 3 6-6"/><path d="M15 8h5v5"/>',
     "star": '<path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2L12 17.3 6.4 20.2l1.1-6.2L3 9.6l6.2-.9Z"/>',
     "copy": '<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/>',
@@ -594,6 +616,78 @@ def _rounded_pixmap(data: bytes, size: int, radius: float) -> QPixmap:
     return result
 
 
+class _ListColumns(QObject):
+    # Wraps a QListWidget's rows into two columns once its viewport is wide enough for both.
+    # Rows without UserRole data (empty / loading messages) keep the full width.
+    GAP = 3 # QListView spacing: pads every side of every item, so columns end up 2*GAP apart
+
+    def __init__(self, list_widget: "QListWidget", min_column_width: int, parent=None):
+        super().__init__(parent)
+        self._list = list_widget
+        self._min_col = min_column_width
+        self.columns = 1
+        self._viewport = list_widget.viewport()
+        self._viewport.installEventFilter(self)
+        list_widget.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self._col_w = self._full_w = 0
+        # Rows are sized as they arrive, so a rebuilt list never paints a frame at width 0
+        list_widget.model().rowsInserted.connect(lambda _parent, first, last: self._fit_rows(first, last))
+
+    def eventFilter(self, obj, event):
+        if obj is self._viewport and event.type() == QEvent.Type.Resize:
+            self.refit()
+        return False
+
+    def _layout_width(self) -> int:
+        # Mirrors QListViewPrivate::prepareItemsLayout: a LeftToRight flow wraps against
+        # maximumViewportSize less the style's scrollbar extent, whether the bar shows or not
+        lst = self._list
+        width = lst.maximumViewportSize().width()
+        style, vbar = lst.style(), lst.verticalScrollBar()
+        if (lst.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAsNeeded
+                and not style.pixelMetric(QStyle.PixelMetric.PM_ScrollView_ScrollBarOverlap, None, vbar)):
+            width -= style.pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent, None, vbar)
+            if style.styleHint(QStyle.StyleHint.SH_ScrollView_FrameOnlyAroundContents, None, lst):
+                width -= style.pixelMetric(QStyle.PixelMetric.PM_DefaultFrameWidth, None, lst) * 2
+        return width
+
+    def refit(self) -> None:
+        lst = self._list
+        width = self._layout_width()
+        columns = 2 if width >= self._min_col * 2 + self.GAP * 4 else 1
+        if columns != self.columns:
+            self.columns = columns
+            grid = columns > 1
+            lst.setFlow(QListWidget.Flow.LeftToRight if grid else QListWidget.Flow.TopToBottom)
+            lst.setWrapping(grid)
+            lst.setSpacing(self.GAP if grid else 0)
+        if columns == 1:
+            self._col_w = self._full_w = 0 # single-column ListMode stretches rows to the viewport
+        else:
+            # one px of slack so rounding never pushes the second column onto its own line
+            self._col_w = (width - self.GAP * 2 * columns) // columns - 1
+            self._full_w = width - self.GAP * 2 - 1
+        if self._fit_rows(0, lst.count() - 1):
+            # a size-hint change alone never re-lays a ListMode view (or drops its uniform-size cache)
+            lst.scheduleDelayedItemsLayout()
+
+    def _fit_rows(self, first: int, last: int) -> bool:
+        changed = False
+        for row in range(first, last + 1):
+            item = self._list.item(row)
+            if item is None:
+                continue
+            target = self._col_w if item.data(Qt.ItemDataRole.UserRole) else self._full_w
+            hint = item.sizeHint()
+            if hint.width() != target:
+                # a stored hint wins over the delegate, so never store a -1 height
+                height = hint.height() if hint.height() > 0 else self._list.sizeHintForIndex(
+                    self._list.indexFromItem(item)).height()
+                item.setSizeHint(QSize(target, height))
+                changed = True
+        return changed
+
+
 class _ChartGameDelegate(QStyledItemDelegate):
     # Paints one Charts row: rank, icon, name, then "playing · liked · genre".
     ROW_HEIGHT = 58
@@ -604,9 +698,11 @@ class _ChartGameDelegate(QStyledItemDelegate):
         self._icon_lookup = icon_lookup
 
     def sizeHint(self, option, index):
+        hint = index.data(Qt.ItemDataRole.SizeHintRole)
+        width = hint.width() if isinstance(hint, QSize) and hint.width() > 0 else 0 # set by _ListColumns
         if isinstance(index.data(Qt.ItemDataRole.UserRole), dict):
-            return QSize(0, self.ROW_HEIGHT)
-        return QSize(0, 80)
+            return QSize(width, self.ROW_HEIGHT)
+        return QSize(width, 80)
 
     def paint(self, painter, option, index):
         game = index.data(Qt.ItemDataRole.UserRole)
@@ -816,6 +912,13 @@ class _HotkeyCaptureButton(QPushButton):
         self.releaseKeyboard()
         self.setText(self._sequence)
         self.recording_canceled.emit()
+
+    def event(self, event) -> bool:
+        # While recording, claim every combo before window shortcuts (Ctrl+B) can take it
+        if getattr(self, "_recording", False) and event.type() == QEvent.Type.ShortcutOverride:
+            event.accept()
+            return True
+        return super().event(event)
 
     def keyPressEvent(self, event) -> None:
         if not self._recording:
@@ -2470,10 +2573,14 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         super().mouseReleaseEvent(event)
 
     # Left nav panel
+    _NAV_WIDE = 232
+    _NAV_NARROW = 72 # 14px margins + a 44px column that fits the 40px logo and nav icons
+
     def _build_nav_panel(self) -> QFrame:
         panel = QFrame()
         panel.setObjectName("navPanel")
-        panel.setFixedWidth(232)
+        panel.setFixedWidth(self._NAV_WIDE)
+        self._nav_panel = panel
 
         lay = QVBoxLayout(panel)
         lay.setContentsMargins(14, 16, 14, 14)
@@ -2497,6 +2604,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         sub_lbl.setObjectName("brandSub")
         words.addWidget(name_lbl)
         words.addWidget(sub_lbl)
+        self._brand_word_lbls = (name_lbl, sub_lbl)
         brand_lay.addLayout(words)
         brand_lay.addStretch(1)
         lay.addWidget(brand)
@@ -2523,11 +2631,13 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             if page_idx is None:
                 section = QLabel(label)
                 section.setObjectName("navSection")
+                section.setProperty("navLabel", label)
                 lay.addWidget(section)
                 self._nav_section_lbls.append(section)
                 continue
             btn = QPushButton(f"  {label}")
             btn.setObjectName("navTab")
+            btn.setProperty("navLabel", label)
             btn.setIcon(_svg_icon(icon_name, MUTED, ACCENT_TEXT, 18))
             btn.setIconSize(QSize(18, 18))
             btn.setCheckable(True)
@@ -2550,6 +2660,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         # Setup nav button
         self._setup_nav_btn = QPushButton("  Setup")
         self._setup_nav_btn.setObjectName("navTab")
+        self._setup_nav_btn.setProperty("navLabel", "Setup")
         self._setup_nav_btn.setIcon(_svg_icon("setup", MUTED, ACCENT_TEXT, 18))
         self._setup_nav_btn.setIconSize(QSize(18, 18))
         self._setup_nav_btn.setCheckable(True)
@@ -2578,9 +2689,13 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             stats_lay.addLayout(cell, 1)
             setattr(self, attr, value)
         lay.addWidget(stats)
-        lay.addSpacing(8)
+        self._nav_stats_card = stats
+        self._nav_stats_gap = QWidget()
+        self._nav_stats_gap.setFixedHeight(8)
+        lay.addWidget(self._nav_stats_gap)
 
         kill_roblox_button = QPushButton("  Kill All Roblox")
+        self._nav_kill_btn = kill_roblox_button
         kill_roblox_button.setObjectName("danger")
         kill_roblox_button.setIcon(_svg_icon("power", DANGER, size=15))
         kill_roblox_button.setIconSize(QSize(15, 15))
@@ -2589,12 +2704,30 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         kill_roblox_button.setToolTip("Close every running Roblox process")
         kill_roblox_button.clicked.connect(self._on_kill_all_roblox)
         lay.addWidget(kill_roblox_button)
-        lay.addSpacing(8)
+        lay.addSpacing(6)
 
+        # Collapse toggle shares a row with the version; collapsed, only the toggle stays
+        foot = QHBoxLayout()
+        foot.setContentsMargins(0, 0, 0, 0)
+        foot.setSpacing(4)
+        self._nav_toggle_btn = QPushButton()
+        self._nav_toggle_btn.setObjectName("navTab")
+        self._nav_toggle_btn.setIconSize(QSize(18, 18))
+        self._nav_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._nav_toggle_btn.clicked.connect(self._toggle_nav_collapsed)
+        foot.addWidget(self._nav_toggle_btn, 1)
         ver_lbl = QLabel(f"v{APP_VERSION}")
         ver_lbl.setObjectName("versionText")
-        ver_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        lay.addWidget(ver_lbl)
+        ver_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        foot.addWidget(ver_lbl)
+        self._nav_version_lbl = ver_lbl
+        lay.addLayout(foot)
+
+        self._nav_shortcut = QShortcut(QKeySequence("Ctrl+B"), self)
+        self._nav_shortcut.activated.connect(self._toggle_nav_collapsed)
+        self._nav_collapsed = False
+        self._nav_anim = None
+        self._set_nav_collapsed(bool(actions.get_ui_setting("sidebar_collapsed", True)), animate=False)
 
         self._client_count_timer = QTimer(self)
         self._client_count_timer.setInterval(4000)
@@ -2625,6 +2758,62 @@ class AccountManagerUIQt(QMainWindow): # Main Window
     def _on_client_count(self, count: int) -> None:
         if hasattr(self, "_stat_clients_lbl"):
             self._stat_clients_lbl.setText(str(count))
+
+    def _toggle_nav_collapsed(self) -> None:
+        self._set_nav_collapsed(not self._nav_collapsed)
+        actions.save_ui_setting("sidebar_collapsed", self._nav_collapsed)
+
+    def _set_nav_collapsed(self, collapsed: bool, animate: bool = True) -> None:
+        panel = self._nav_panel
+        self._nav_collapsed = collapsed
+        if self._nav_anim is not None:
+            self._nav_anim.stop() # stop() skips finished, so a cut-short expand never restores labels
+        self._nav_toggle_btn.setIcon(_svg_icon("panel-open" if collapsed else "panel-close", MUTED, size=18))
+        self._nav_toggle_btn.setToolTip(("Expand" if collapsed else "Collapse") + " sidebar (Ctrl+B)")
+        # Labels go before narrowing and come back after widening, so text never clips mid-slide
+        if collapsed:
+            self._apply_nav_labels(True)
+        start = panel.maximumWidth()
+        target = self._NAV_NARROW if collapsed else self._NAV_WIDE
+        if not animate or start == target or not self.isVisible():
+            panel.setFixedWidth(target)
+            if not collapsed:
+                self._apply_nav_labels(False)
+            return
+        anim = QVariantAnimation(self)
+        anim.setStartValue(start)
+        anim.setEndValue(target)
+        anim.setDuration(170)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.valueChanged.connect(lambda value: panel.setFixedWidth(int(value)))
+        if not collapsed:
+            anim.finished.connect(lambda: self._apply_nav_labels(False))
+        self._nav_anim = anim
+        anim.start()
+
+    def _apply_nav_labels(self, collapsed: bool) -> None:
+        for btn in self._normal_nav_btns + [self._setup_nav_btn]:
+            label = btn.property("navLabel")
+            btn.setText("" if collapsed else f"  {label}")
+            if btn is not self._setup_nav_btn:
+                btn.setToolTip(f"{label}  ·  right-click for window options" if collapsed
+                               else "Right-click for window options")
+            elif collapsed:
+                btn.setToolTip(label)
+            else:
+                btn.setToolTip("")
+        # A no-break space keeps each section header's height, so the icons don't jump
+        for section in self._nav_section_lbls:
+            section.setText(" " if collapsed else section.property("navLabel"))
+        for word in self._brand_word_lbls:
+            word.setVisible(not collapsed)
+        self._nav_stats_card.setVisible(not collapsed)
+        self._nav_stats_gap.setVisible(not collapsed)
+        self._nav_kill_btn.setText("" if collapsed else "  Kill All Roblox")
+        self._nav_kill_btn.setToolTip("Kill All Roblox: close every running Roblox process" if collapsed
+                                      else "Close every running Roblox process")
+        self._nav_version_lbl.setVisible(not collapsed)
+        self._nav_toggle_btn.setText("" if collapsed else "  Collapse")
 
     def _build_setup_panel(self) -> QWidget: # Encryption setup panel
         panel = QWidget()
@@ -2896,6 +3085,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         )
         self._account_list.viewport().installEventFilter(self._drag_filter)
         self._drag_filter.reorder_requested.connect(self._on_account_reorder)
+        self._account_columns = _ListColumns(self._account_list, 240, self)
 
         lay.addWidget(self._account_list, 1)
 
@@ -8057,6 +8247,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         self._chart_list.customContextMenuRequested.connect(self._on_chart_context_menu)
         self._chart_list.currentItemChanged.connect(self._on_chart_item_changed)
         self._chart_list.itemDoubleClicked.connect(lambda _item: self._on_charts_join())
+        self._chart_columns = _ListColumns(self._chart_list, 280, self)
         lay.addWidget(self._chart_list, 1)
         page_lay.addWidget(card, 1)
         page_lay.addWidget(self._build_chart_side_panel())
