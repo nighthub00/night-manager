@@ -4330,6 +4330,39 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         window_grid_row.addWidget(self._sett_window_grid_key_btn)
         f.addLayout(window_grid_row)
 
+        window_grid_size_row = QHBoxLayout()
+        window_grid_size_row.setContentsMargins(20, 0, 0, 0)
+        window_grid_size_label = QLabel("Max Tile Size")
+        window_grid_size_label.setToolTip(
+            "Largest size for each Roblox window in the grid.\n"
+            "Windows pack from the top-left corner and can go smaller than\n"
+            "Roblox normally allows. Fill uses all of the monitor."
+        )
+        window_grid_size_row.addWidget(window_grid_size_label)
+        window_grid_size_row.addStretch(1)
+        self._sett_window_grid_size_spins = []
+        for key, axis in (
+            ("window_grid_max_width", "Width"),
+            ("window_grid_max_height", "Height"),
+        ):
+            if axis == "Height":
+                window_grid_size_row.addWidget(QLabel("×"))
+            spin = QSpinBox()
+            spin.setRange(0, 7680)
+            spin.setSingleStep(10)
+            spin.setSpecialValueText("Fill")
+            spin.setValue(int(S.get(key, 0) or 0))
+            spin.setFixedWidth(70)
+            spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+            spin.setEnabled(bool(S.get("window_grid_enabled", False)))
+            spin.setToolTip(f"Max tile {axis.lower()} in pixels. 0 = Fill.")
+            spin.valueChanged.connect(
+                lambda v, k=key: actions.save_ui_setting(k, v)
+            )
+            window_grid_size_row.addWidget(spin)
+            self._sett_window_grid_size_spins.append(spin)
+        f.addLayout(window_grid_size_row)
+
         f.addWidget(_sec("FIXES"))
         self._sett_installer_fix_chk = _chk(
             "roblox_installer_fix", "Roblox Installer Fix",
@@ -5479,6 +5512,8 @@ class AccountManagerUIQt(QMainWindow): # Main Window
     def _on_sett_window_grid(self, enabled: bool) -> None:
         if hasattr(self, "_sett_window_grid_key_btn"):
             self._sett_window_grid_key_btn.setEnabled(enabled)
+        for spin in getattr(self, "_sett_window_grid_size_spins", ()):
+            spin.setEnabled(enabled)
         if enabled:
             self._apply_window_grid_hotkey()
         else:
@@ -6903,7 +6938,11 @@ class AccountManagerUIQt(QMainWindow): # Main Window
 
     def nativeEvent(self, event_type, message):
         if window_grid_mod.is_hotkey_message(message):
-            result = window_grid_mod.tile_roblox_windows()
+            settings = actions.load_ui_settings()
+            result = window_grid_mod.tile_roblox_windows(
+                int(settings.get("window_grid_max_width", 0) or 0),
+                int(settings.get("window_grid_max_height", 0) or 0),
+            )
             if not result:
                 print(f"[Window Grid] {result.code}: {result.message}")
                 if result.detail:

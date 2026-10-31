@@ -62,6 +62,32 @@ _user32.RegisterHotKey.argtypes = [
 ]
 _user32.UnregisterHotKey.restype = wintypes.BOOL
 _user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+_user32.SetWindowPos.restype = wintypes.BOOL
+_user32.SetWindowPos.argtypes = [
+    wintypes.HWND,
+    wintypes.HWND,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    wintypes.UINT,
+]
+
+_dwmapi = ctypes.WinDLL("dwmapi")
+_dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+_dwmapi.DwmGetWindowAttribute.argtypes = [
+    wintypes.HWND,
+    wintypes.DWORD,
+    ctypes.c_void_p,
+    wintypes.DWORD,
+]
+
+_DWMWA_EXTENDED_FRAME_BOUNDS = 9
+_SWP_NOZORDER = 0x0004
+_SWP_NOACTIVATE = 0x0010
+# Skips WM_WINDOWPOSCHANGING, which is where Roblox clamps the window to its
+# minimum tracking size, so grid cells can be smaller than a manual drag allows.
+_SWP_NOSENDCHANGING = 0x0400
 
 
 def _parse_hotkey(sequence: str) -> tuple[int, int] | None:
@@ -195,13 +221,59 @@ def _get_cursor_monitor_work_area() -> tuple[int, int, int, int]:
     return tuple(win32api.GetMonitorInfo(monitor)["Work"])
 
 
-def _grid_dimensions(count: int) -> tuple[int, int]:
-    columns = math.ceil(math.sqrt(count))
+def _frame_insets(hwnd: int) -> tuple[int, int, int, int]:
+    """Invisible resize borders between GetWindowRect and the visible frame."""
+    window = win32gui.GetWindowRect(hwnd)
+    frame = wintypes.RECT()
+    if _dwmapi.DwmGetWindowAttribute(
+        hwnd,
+        _DWMWA_EXTENDED_FRAME_BOUNDS,
+        ctypes.byref(frame),
+        ctypes.sizeof(frame),
+    ):
+        return 0, 0, 0, 0
+    return (
+        max(0, frame.left - window[0]),
+        max(0, frame.top - window[1]),
+        max(0, window[2] - frame.right),
+        max(0, window[3] - frame.bottom),
+    )
+
+
+def _place_window(hwnd: int, x: int, y: int, width: int, height: int) -> None:
+    if win32gui.IsIconic(hwnd) or _user32.IsZoomed(hwnd):
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+    inset_left, inset_top, inset_right, inset_bottom = _frame_insets(hwnd)
+    if not _user32.SetWindowPos(
+        hwnd,
+        None,
+        x - inset_left,
+        y - inset_top,
+        width + inset_left + inset_right,
+        height + inset_top + inset_bottom,
+        _SWP_NOZORDER | _SWP_NOACTIVATE | _SWP_NOSENDCHANGING,
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _grid_dimensions(
+    count: int,
+    available_width: int,
+    max_cell_width: int,
+) -> tuple[int, int]:
+    if max_cell_width > 0:
+        columns = max(1, min(count, available_width // max_cell_width))
+    else:
+        columns = math.ceil(math.sqrt(count))
     rows = math.ceil(count / columns)
     return columns, rows
 
 
-def tile_roblox_windows() -> OperationResult:
+def tile_roblox_windows(
+    max_width: int = 0,
+    max_height: int = 0,
+) -> OperationResult:
+    """Tile every Roblox window; a max size of 0 lets that side fill its cell."""
     windows = _get_roblox_windows()
     if not windows:
         return OperationResult.failure(
@@ -212,19 +284,31 @@ def tile_roblox_windows() -> OperationResult:
 
     try:
         left, top, right, bottom = _get_cursor_monitor_work_area()
-        columns, rows = _grid_dimensions(len(windows))
         available_width = right - left
         available_height = bottom - top
         gap = 4
+        max_cell_width = max_width + gap * 2 if max_width > 0 else 0
+        max_cell_height = max_height + gap * 2 if max_height > 0 else 0
+        columns, rows = _grid_dimensions(
+            len(windows), available_width, max_cell_width
+        )
+        # Capped tiles pack from the top-left corner and only shrink further
+        # when there are too many windows to fit at the requested size.
+        grid_width = available_width
+        if max_cell_width:
+            grid_width = min(available_width, columns * max_cell_width)
+        grid_height = available_height
+        if max_cell_height:
+            grid_height = min(available_height, rows * max_cell_height)
         moved = 0
 
         for index, hwnd in enumerate(windows):
             row = index // columns
             column = index % columns
-            cell_left = left + column * available_width // columns
-            cell_right = left + (column + 1) * available_width // columns
-            cell_top = top + row * available_height // rows
-            cell_bottom = top + (row + 1) * available_height // rows
+            cell_left = left + column * grid_width // columns
+            cell_right = left + (column + 1) * grid_width // columns
+            cell_top = top + row * grid_height // rows
+            cell_bottom = top + (row + 1) * grid_height // rows
 
             x = cell_left + gap
             y = cell_top + gap
@@ -232,8 +316,7 @@ def tile_roblox_windows() -> OperationResult:
             height = max(1, cell_bottom - cell_top - gap * 2)
 
             try:
-                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                win32gui.MoveWindow(hwnd, x, y, width, height, True)
+                _place_window(hwnd, x, y, width, height)
                 moved += 1
             except Exception as exc:
                 print(f"[Window Grid] Failed to move window {hwnd}: {exc}")
