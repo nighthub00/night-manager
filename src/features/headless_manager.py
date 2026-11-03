@@ -78,7 +78,7 @@ class HeadlessManager:
         self._enforce_thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._hidden_pids: set[int] = set()
-        self._uid_cache: dict[int, str] = {}   # pid -> user_id
+        self._uid_cache: dict[int, tuple[float, str, str]] = {}   # pid -> (create_time, user_id, log_path)
         self._name_cache: dict[str, str] = {}  # user_id -> username
         self._pid_username: dict[int, str] = {}  # pid -> username, for window title matching
         self._last_results: list[dict] = []
@@ -189,19 +189,26 @@ class HeadlessManager:
 
     def _do_scan(self) -> None:
         try:
-            pids = _get_roblox_pids()
+            processes = presence_mod.get_roblox_processes()
+            pids = set(processes)
             with self._lock:
                 self._hidden_pids &= pids
-            self._uid_cache = {p: u for p, u in self._uid_cache.items() if p in pids}
+            # Keyed on create time too, so a reused PID can't inherit another account.
+            self._uid_cache = {
+                p: value for p, value in self._uid_cache.items()
+                if p in processes and value[0] == processes[p][0]
+            }
 
-            used_logs: set[str] = set()
+            used_logs: set[str] = {value[2] for value in self._uid_cache.values()}
             results: list[dict] = []
-            for pid in sorted(pids):
-                user_id = self._uid_cache.get(pid)
+            for pid in sorted(pids, key=lambda p: processes[p][0]):
+                cached = self._uid_cache.get(pid)
+                user_id = cached[1] if cached else None
                 if user_id is None:
-                    user_id = presence_mod._get_user_id_from_pid(pid, used_logs)
-                    if user_id:
-                        self._uid_cache[pid] = user_id
+                    entry = presence_mod._get_log_entry_from_pid(pid, used_logs)
+                    if entry:
+                        user_id = entry.user_id
+                        self._uid_cache[pid] = (processes[pid][0], user_id, entry.path)
                 if not user_id:
                     continue
 
@@ -226,6 +233,7 @@ class HeadlessManager:
             with self._lock:
                 self._pid_username = {p: u for p, u in self._pid_username.items() if p in pids}
 
+            results.sort(key=lambda row: row["pid"])
             if results != self._last_results:
                 self._last_results = [dict(row) for row in results]
                 self._on_update(results)

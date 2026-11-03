@@ -22,6 +22,7 @@ import json
 import secrets
 import shlex
 import threading
+import time
 import websockets
 from typing import Callable
 import features.auto_rejoin as _ar
@@ -111,7 +112,12 @@ class WebSocketServer:
         port = self._get_port()
         host = "localhost"
         try:
-            async with websockets.serve(self._client_handler, host, port):
+            # Browsers send an Origin header and let any web page open
+            # ws://localhost. origins=[None] admits only clients without one
+            # (scripts and tools), so a visited site can't drive the accounts.
+            async with websockets.serve(
+                self._client_handler, host, port, origins=[None],
+            ):
                 self.running = True
                 self._async_stop = asyncio.Event()
                 print(f"[INFO] WebSocket server started at ws://{host}:{port}")
@@ -203,7 +209,8 @@ class WebSocketServer:
             return False, "", "Auth format: AUTH <password> | <command>"
 
         provided = " ".join(auth_parts[1:])
-        if not secrets.compare_digest(provided, stored):
+        if not secrets.compare_digest(provided.encode("utf-8"), stored.encode("utf-8")):
+            time.sleep(1.0) # slows password guessing; runs in an executor thread
             return False, "", "Authentication failed"
 
         return True, cmd_seg, None

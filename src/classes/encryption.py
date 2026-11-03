@@ -14,6 +14,8 @@ from Crypto.Cipher import AES  # nosec B413
 from Crypto.Random import get_random_bytes  # nosec B413
 from Crypto.Protocol.KDF import PBKDF2  # nosec B413
 
+from utils.atomic_file import write_json_atomic
+
 _MACHINE_ID_CACHE = {}
 
 class EncryptionError(Exception):
@@ -59,6 +61,52 @@ class HardwareEncryption:
         cached = _MACHINE_ID_CACHE.get("stable")
         if cached:
             return cached
+        machine_id = self._get_machine_id_wmi() or self._get_machine_id_per_query()
+        _MACHINE_ID_CACHE["stable"] = machine_id
+        return machine_id
+
+    def _get_machine_id_wmi(self):
+        # The same three values _get_machine_id_per_query reads, queried in-process
+        # through WMI: ~0.15s instead of ~1.9s for three PowerShell starts. Lines are
+        # joined like PowerShell prints them, so the ID (and the key) is identical.
+        if platform.system() != "Windows":
+            return None
+        try:
+            import pythoncom
+            import win32com.client
+            pythoncom.CoInitialize()
+        except Exception:
+            return None
+        def _read_identifiers():
+            # Every COM object lives in this scope and is released before CoUninitialize.
+            service = win32com.client.GetObject(r"winmgmts:root\cimv2")
+            identifiers = []
+            for wmi_class, prop in (
+                ("Win32_ComputerSystemProduct", "UUID"),
+                ("Win32_Processor", "ProcessorId"),
+                ("Win32_BaseBoard", "SerialNumber"),
+            ):
+                values = [
+                    getattr(item, prop)
+                    for item in service.ExecQuery(f"SELECT {prop} FROM {wmi_class}")
+                ]
+                identifiers.append(
+                    "\r\n".join("" if v is None else str(v) for v in values).strip()
+                )
+            return identifiers
+
+        try:
+            machine_string = "-".join(_read_identifiers())
+            return hashlib.sha256(machine_string.encode()).hexdigest()
+        except Exception:
+            return None
+        finally:
+            pythoncom.CoUninitialize()
+
+    def _get_machine_id_per_query(self):
+        cached = _MACHINE_ID_CACHE.get("per_query")
+        if cached:
+            return cached
         identifiers = []
 
         try:
@@ -98,7 +146,7 @@ class HardwareEncryption:
 
         machine_string = "-".join(identifiers)
         machine_id = hashlib.sha256(machine_string.encode()).hexdigest()
-        _MACHINE_ID_CACHE["stable"] = machine_id
+        _MACHINE_ID_CACHE["per_query"] = machine_id
         return machine_id
 
     def _get_v264_machine_id(self):
@@ -205,6 +253,7 @@ class HardwareEncryption:
 
         candidate_ids = {self.machine_id}
         for source, machine_id_getter in (
+            ("per_query", self._get_machine_id_per_query),
             ("v264", self._get_v264_machine_id),
             ("legacy", self._get_legacy_machine_id),
         ):
@@ -215,6 +264,12 @@ class HardwareEncryption:
             try:
                 key = self._derive_key_from_machine_id(machine_id)
                 result = _decrypt_with_key(key)
+                if source == "per_query":
+                    # The one-call read disagreed with the original method here;
+                    # keep using the original so saved data stays readable.
+                    self.machine_id, self.key = machine_id, key
+                    _MACHINE_ID_CACHE["stable"] = machine_id
+                    source = "stable"
                 self.decryption_key_source = source
                 return result
             except Exception:
@@ -308,38 +363,29 @@ class EncryptionConfig:
     def __init__(self, config_file="encryption_config.json"):
         self.config_file = config_file
         self.config = self._load_config()
-    
+        if self.config.pop('password_hash', None) is not None:
+            # Older builds stored an unsalted SHA-256 of the password here. Nothing
+            # reads it (AES-GCM already checks the password), and it let anyone with
+            # this file test guesses far faster than the PBKDF2 key allows.
+            try:
+                self.save_config()
+            except Exception as e:
+                print(f"[WARNING] Could not remove the stored password hash: {e}")
+
     def _load_config(self):
         """Load encryption configuration from file"""
         if os.path.exists(self.config_file):
             try:
                 with open(self.config_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    loaded = json.load(f)
+                return loaded if isinstance(loaded, dict) else {}
             except:
                 return {}
         return {}
-    
+
     def save_config(self):
         """Save encryption configuration to file"""
-        config_dir = os.path.dirname(self.config_file)
-        if config_dir and not os.path.exists(config_dir):
-            os.makedirs(config_dir)
-        
-        temp_file = self.config_file + ".tmp"
-        try:
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump(self.config, f, indent=2, ensure_ascii=False)
-            os.replace(temp_file, self.config_file)
-        except Exception as e:
-            print(f"[WARNING] Safe config save failed: {e}. Falling back to original direct write.")
-            if os.path.exists(temp_file):
-                try:
-                    os.remove(temp_file)
-                except:
-                    pass
-            # Original direct write fallback
-            with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump(self.config, f, indent=2, ensure_ascii=False)
+        write_json_atomic(self.config_file, self.config)
     
     def is_encryption_enabled(self):
         """Check if encryption is enabled"""
@@ -361,10 +407,6 @@ class EncryptionConfig:
         """Get stored salt for password encryption"""
         return self.config.get('salt', None)
     
-    def get_password_hash(self):
-        """Get stored password hash"""
-        return self.config.get('password_hash', None)
-    
     def enable_hardware_encryption(self):
         """Enable hardware-based encryption"""
         self.config['encryption_enabled'] = True
@@ -372,12 +414,11 @@ class EncryptionConfig:
         self.config['setup_completed'] = True
         self.save_config()
     
-    def enable_password_encryption(self, salt, password_hash):
+    def enable_password_encryption(self, salt):
         """Enable password-based encryption"""
         self.config['encryption_enabled'] = True
         self.config['encryption_method'] = 'password'
         self.config['salt'] = salt
-        self.config['password_hash'] = password_hash
         self.config['setup_completed'] = True
         self.save_config()
     

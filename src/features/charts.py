@@ -40,6 +40,7 @@ _LOCK = threading.RLock()
 _EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="chart-icon")
 _INFLIGHT: set[str] = set()
 _sorts_cache: tuple[float, list[dict]] | None = None
+_pruned = False
 
 
 def _get_session() -> requests.Session:
@@ -248,12 +249,19 @@ def _download_icon(universe_id: str, url: str, on_ready: Callable[[str, bytes], 
     try:
         response = _get_session().get(url, timeout=10)
         if response.status_code == 200 and response.content:
+            path = _icon_path(universe_id)
+            temp_path = f"{path}.{threading.get_ident()}.part"
             try:
+                # Write beside the target and swap, so a reader never sees half an icon.
                 os.makedirs(_ICON_CACHE_DIR, exist_ok=True)
-                with open(_icon_path(universe_id), "wb") as f:
+                with open(temp_path, "wb") as f:
                     f.write(response.content)
+                os.replace(temp_path, path)
             except OSError:
-                pass
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
             on_ready(universe_id, response.content)
     except requests.RequestException:
         pass
@@ -303,10 +311,31 @@ def _resolve_icons(universe_ids: list[str], on_ready: Callable[[str, bytes], Non
                     _INFLIGHT.discard(universe_id)
 
 
+def _prune_icon_cache() -> None:
+    # Icons past their age are only overwritten when that game shows up again, so
+    # games that left the charts used to stay on disk forever.
+    cutoff = time.time() - _ICON_MAX_AGE
+    try:
+        names = os.listdir(_ICON_CACHE_DIR)
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(_ICON_CACHE_DIR, name)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError:
+            pass
+
+
 def fetch_icons_async(universe_ids: list[str], on_ready: Callable[[str, bytes], None]) -> None:
     """Calls on_ready(universe_id, png_bytes) from a worker thread as each icon arrives."""
+    global _pruned
     wanted = []
     with _LOCK:
+        if not _pruned:
+            _pruned = True
+            _EXECUTOR.submit(_prune_icon_cache)
         for universe_id in dict.fromkeys(str(u) for u in universe_ids if u):
             if universe_id not in _INFLIGHT:
                 _INFLIGHT.add(universe_id)

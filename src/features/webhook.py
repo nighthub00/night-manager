@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from io import BytesIO
 from typing import Callable
 
+from features.diagnostics import redact
+
 
 _APP_FOOTER = "NIGHT MANAGER"
 _AR_EVENTS: list[tuple[str, str, int]] = [
@@ -56,7 +58,7 @@ def send_screenshot(url: str, caption: str = "") -> None:
                 "$b=New-Object System.Drawing.Bitmap($s.Width,$s.Height); "
                 "$g=[System.Drawing.Graphics]::FromImage($b); "
                 "$g.CopyFromScreen($s.Location,[System.Drawing.Point]::Empty,$s.Size); "
-                f"$b.Save('{tmp_path}',[System.Drawing.Imaging.ImageFormat]::Png); "
+                f"$b.Save('{tmp_path.replace(chr(39), chr(39) * 2)}',[System.Drawing.Imaging.ImageFormat]::Png); "
                 "$g.Dispose();$b.Dispose()"
             )
             result = subprocess.run(
@@ -167,6 +169,8 @@ class WebhookStdoutInterceptor:
             return -1
 
     def _handle(self, line: str) -> None:
+        # The session log redacts below this layer; the console and Discord sit above it.
+        line = redact(line)
         self._push_console(line)
         if not line.strip():
             return

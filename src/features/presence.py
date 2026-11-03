@@ -39,10 +39,21 @@ class RobloxLogEntry:
     browser_tracker_id: str
 
 
+_LOG_EARLY_TOLERANCE_SEC = 2.0
+
+
 def _get_user_id_from_pid(
     pid: int,
     used_logs: set[str] | None = None,
 ) -> str | None:
+    entry = _get_log_entry_from_pid(pid, used_logs)
+    return entry.user_id if entry else None
+
+
+def _get_log_entry_from_pid(
+    pid: int,
+    used_logs: set[str] | None = None,
+) -> RobloxLogEntry | None:
     try:
         proc = psutil.Process(pid)
         create_utc = datetime.fromtimestamp(
@@ -50,15 +61,17 @@ def _get_user_id_from_pid(
             tz=timezone.utc,
         ).replace(tzinfo=None)
 
+        # Log names carry whole seconds, so a log opened in the same second the
+        # process started can be stamped slightly before its sub-second create time.
         entries = get_roblox_log_entries(
-            earliest_time=create_utc,
+            earliest_time=create_utc - timedelta(seconds=_LOG_EARLY_TOLERANCE_SEC),
             latest_time=create_utc + timedelta(seconds=60),
         )
         candidates: list[tuple[float, RobloxLogEntry]] = []
         for entry in entries:
             diff = (entry.timestamp - create_utc).total_seconds()
-            if 0 <= diff <= 60:
-                candidates.append((diff, entry))
+            if -_LOG_EARLY_TOLERANCE_SEC <= diff <= 60:
+                candidates.append((abs(diff), entry))
 
         candidates.sort(key=lambda item: item[0])
         for _, entry in candidates:
@@ -66,7 +79,7 @@ def _get_user_id_from_pid(
                 continue
             if used_logs is not None:
                 used_logs.add(entry.path)
-            return entry.user_id
+            return entry
     except (
         OSError,
         psutil.NoSuchProcess,
@@ -344,7 +357,7 @@ class PresenceScanner:
         self._interval = max(5, int(interval_sec))
         self._stop_evt = threading.Event()
         self._thread: threading.Thread | None = None
-        self._pid_uid_cache: dict[int, tuple[float, str]] = {}
+        self._pid_uid_cache: dict[int, tuple[float, str, str]] = {} # pid -> (create_time, user_id, log_path)
         self._process_cache: dict[int, tuple[float, psutil.Process]] = {}
         self._logical_cpu_count = max(1, psutil.cpu_count() or 1)
         self.latest_snapshot: dict[str, dict] = {}
@@ -386,10 +399,11 @@ class PresenceScanner:
         if cached is not None and cached[0] == create_time:
             return cached[1]
 
-        user_id = _get_user_id_from_pid(pid, used_logs)
-        if user_id:
-            self._pid_uid_cache[pid] = (create_time, user_id)
-        return user_id
+        entry = _get_log_entry_from_pid(pid, used_logs)
+        if entry:
+            self._pid_uid_cache[pid] = (create_time, entry.user_id, entry.path)
+            return entry.user_id
+        return None
 
     def _do_scan(self) -> None:
         try:
@@ -422,9 +436,11 @@ class PresenceScanner:
                 self._on_update({})
                 return
 
-            used_logs: set[str] = set()
+            # Logs owned by processes resolved in earlier scans stay claimed, or a
+            # client launched shortly after could pick up another account's log.
+            used_logs: set[str] = {value[2] for value in self._pid_uid_cache.values()}
             matched_processes: list[tuple[str, psutil.Process]] = []
-            for pid in sorted(current_processes):
+            for pid in sorted(current_processes, key=lambda p: current_processes[p][0]):
                 create_time, process = current_processes[pid]
                 user_id = self._resolve_pid_user_id(
                     pid,

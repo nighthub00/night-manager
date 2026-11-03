@@ -51,6 +51,7 @@ from PySide6.QtWidgets import (
     QStyle, QStyleOptionButton, QStyledItemDelegate,
 )
 from PySide6.QtMultimedia import QMediaPlayer, QVideoSink
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtSvg import QSvgRenderer
 from shiboken6 import isValid
 
@@ -60,6 +61,10 @@ from classes import (
     HardwareAccountDecryptionError,
     PasswordRequiredError,
     RobloxAccountManager,
+)
+from classes.account_manager import (
+    cleanup_stale_login_profiles,
+    recover_interrupted_encryption_switch,
 )
 from classes.encryption import EncryptionConfig, PasswordEncryption
 from classes.operation_result import OperationResult, ensure_result
@@ -2995,10 +3000,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             data_folder = get_data_dir()
             enc = EncryptionConfig(os.path.join(data_folder, "encryption_config.json"))
             temp = PasswordEncryption(pw1)
-            enc.enable_password_encryption(
-                temp.get_salt_b64(),
-                hashlib.sha256(pw1.encode()).hexdigest(),
-            )
+            enc.enable_password_encryption(temp.get_salt_b64())
             _show_info(self, "Password Encryption Enabled",
                        "Password encryption is now active.\n"
                        "Keep your password safe, there is no recovery method.")
@@ -3881,15 +3883,21 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         )
         if reply == QMessageBox.StandardButton.Yes:
             try:
-                if getattr(sys, "frozen", False):
-                    executable = sys.executable
-                    params = " ".join(f'"{a}"' for a in sys.argv[1:])
-                else:
-                    executable = sys.executable
-                    params = " ".join(f'"{a}"' for a in sys.argv)
+                executable = sys.executable
+                args = sys.argv[1:] if getattr(sys, "frozen", False) else list(sys.argv)
+                if RELAUNCH_ARG not in args:
+                    args.append(RELAUNCH_ARG) # tells the new copy to wait for this one to close
+                params = " ".join(f'"{a}"' for a in args)
                 os.environ.clear() # the relaunched exe must not inherit this onefile run's _PYI_* state
                 os.environ.update(get_clean_child_env())
-                ctypes.windll.shell32.ShellExecuteW(None, "runas", executable, params, None, 1)
+                shell32 = ctypes.WinDLL("shell32")
+                shell32.ShellExecuteW.restype = ctypes.c_void_p
+                result = shell32.ShellExecuteW(None, "runas", executable, params, None, 1)
+                if (result or 0) <= 32:
+                    # UAC was declined or the start failed; keep this window open.
+                    print(f"[WARNING] Administrator relaunch did not start (code {result}).")
+                    return
+                self._tray_exit_requested = True
                 QApplication.quit()
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to restart as administrator:\n{e}")
@@ -6141,41 +6149,49 @@ class AccountManagerUIQt(QMainWindow): # Main Window
 
     # RAM boost background worker
     def _start_ram_boost(self):
-        if getattr(self, "_ram_boost_running", False):
+        current = getattr(self, "_ram_boost_event", None)
+        if current is not None and not current.is_set():
             return
-        self._ram_boost_running = True
-        self._ram_boost_stop = False
+        # A fresh event per run: toggling off and on quickly used to leave the old
+        # worker asleep, the new start skipped, and the boost silently off.
+        stop_event = threading.Event()
+        self._ram_boost_event = stop_event
         def _worker():
-            kernel32 = ctypes.windll.kernel32
-            psapi = ctypes.windll.psapi
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            psapi = ctypes.WinDLL("psapi")
+            psapi.EmptyWorkingSet.argtypes = [wintypes.HANDLE]
+            # EmptyWorkingSet needs only these; Roblox refuses PROCESS_ALL_ACCESS.
+            access = 0x1000 | 0x0100 # PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA
             print("[INFO] RAM boost started")
-            while not self._ram_boost_stop:
+            while not stop_event.is_set():
                 try:
                     limit_mb = int(actions.load_ui_settings().get("optimize_roblox_ram_limit_mb", 750))
-                    current_pids = set()
-                    for proc in psutil.process_iter(["pid", "name"]):
-                        if proc.info["name"] and proc.info["name"].lower() == "robloxplayerbeta.exe":
-                            current_pids.add(proc.info["pid"])
-                    for pid in current_pids:
+                    for pid, (_, process) in presence_mod.get_roblox_processes().items():
                         try:
-                            mem_mb = psutil.Process(pid).memory_info().rss / 1024 / 1024
+                            mem_mb = process.memory_info().rss / 1024 / 1024
                             if mem_mb >= limit_mb:
-                                h = kernel32.OpenProcess(0x1F0FFF, False, pid)
+                                h = kernel32.OpenProcess(access, False, pid)
                                 if h:
-                                    psapi.EmptyWorkingSet(h)
-                                    kernel32.CloseHandle(h)
-                                    print(f"[INFO] Trimmed RAM for Roblox PID {pid} ({mem_mb:.0f} MB)")
+                                    try:
+                                        if psapi.EmptyWorkingSet(h):
+                                            print(f"[INFO] Trimmed RAM for Roblox PID {pid} ({mem_mb:.0f} MB)")
+                                    finally:
+                                        kernel32.CloseHandle(h)
                         except Exception:
                             pass
                 except Exception as e:
                     print(f"[ERROR] RAM boost error: {e}")
-                time.sleep(15)
-            self._ram_boost_running = False
+                stop_event.wait(15)
             print("[INFO] RAM boost stopped")
         threading.Thread(target=_worker, daemon=True, name="RamBoost").start()
 
     def _stop_ram_boost(self):
-        self._ram_boost_stop = True
+        event = getattr(self, "_ram_boost_event", None)
+        if event is not None:
+            event.set()
 
     # Rename Roblox Windows worker
     def _start_rename_windows(self):
@@ -7128,6 +7144,19 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         # Stop screenshot loop
         try:
             webhook.stop_screenshot_loop()
+        except Exception:
+            pass
+        # Anti-AFK puts back the Roblox windows it maximized and focused when it stops
+        try:
+            actions.stop_anti_afk()
+        except Exception:
+            pass
+        try:
+            self._stop_ram_boost()
+        except Exception:
+            pass
+        try:
+            actions.disable_multi_roblox()
         except Exception:
             pass
         # Stop presence scanner
@@ -10075,6 +10104,79 @@ class _PasswordDialog(QDialog):
         self.accept()
 
 
+RELAUNCH_ARG = "--relaunched"
+_PASSWORD_ATTEMPTS = 5
+_INSTANCE_MUTEX = None
+
+
+def _instance_key() -> str:
+    # One instance per data folder: two copies sharing saved_accounts.json each
+    # overwrite the other's changes, and a second copy keeps the exe locked so
+    # the updater cannot replace it. Separate installs still run side by side.
+    data_dir = os.path.normcase(os.path.abspath(get_data_dir()))
+    return "NightManager-" + hashlib.sha256(data_dir.encode("utf-8")).hexdigest()[:16]
+
+
+def _claim_single_instance(wait_seconds: float) -> bool:
+    """True when no other NIGHT MANAGER is using this data folder."""
+    global _INSTANCE_MUTEX
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel32.CreateMutexW(None, False, "Local\\" + _instance_key())
+    if not handle:
+        # Access denied means an elevated copy owns it; any other failure lets us run.
+        return ctypes.get_last_error() != 5
+    # WAIT_OBJECT_0 or WAIT_ABANDONED (the previous owner exited) both hand us ownership.
+    if kernel32.WaitForSingleObject(handle, int(wait_seconds * 1000)) in (0x0, 0x80):
+        _INSTANCE_MUTEX = handle # held until the process exits
+        return True
+    kernel32.CloseHandle(handle)
+    return False
+
+
+def _signal_running_instance() -> bool:
+    socket = QLocalSocket()
+    socket.connectToServer(_instance_key())
+    if not socket.waitForConnected(1500):
+        return False
+    socket.write(b"show")
+    socket.flush()
+    socket.waitForBytesWritten(500)
+    socket.disconnectFromServer()
+    return True
+
+
+def _listen_for_other_instances(window) -> None:
+    server = QLocalServer(window)
+    server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+    if not server.listen(_instance_key()):
+        QLocalServer.removeServer(_instance_key())
+        if not server.listen(_instance_key()):
+            print(f"[WARNING] Single-instance listener unavailable: {server.errorString()}")
+            return
+
+    def _on_connection():
+        while server.hasPendingConnections():
+            socket = server.nextPendingConnection()
+            socket.disconnected.connect(socket.deleteLater)
+            socket.disconnectFromServer()
+        window._show_from_tray()
+
+    server.newConnection.connect(_on_connection)
+
+
+def _sweep_stale_temp_files() -> None:
+    try:
+        updater_mod.cleanup_stale_update_dirs()
+        cleanup_stale_login_profiles()
+    except Exception as exc:
+        print(f"[WARNING] Temp cleanup failed: {exc}")
+
+
 def main(icon_path: str | None = None) -> int:
     # QApplication MUST exist before any QWidget / QDialog is created.
     # Create it first, before setup_encryption() and before _PasswordDialog.
@@ -10085,20 +10187,27 @@ def main(icon_path: str | None = None) -> int:
     apply_palette(app)
     diagnostics.set_startup_stage("QApplication ready")
 
+    # A relaunch (e.g. as administrator) starts before the old window has closed.
+    if not _claim_single_instance(20.0 if RELAUNCH_ARG in sys.argv else 0.0):
+        if not _signal_running_instance():
+            QMessageBox.information(
+                None, APP_NAME,
+                f"{APP_NAME} is already running. Look for it in the system tray.",
+            )
+        return 0
+    threading.Thread(target=_sweep_stale_temp_files, daemon=True, name="TempSweep").start()
+
     password = None
     try:
         diagnostics.set_startup_stage("loading encryption settings")
         data_folder = get_data_dir()
         os.makedirs(data_folder, exist_ok=True)
+        recover_interrupted_encryption_switch(data_folder)
         enc_cfg = EncryptionConfig(os.path.join(data_folder, "encryption_config.json"))
-
-        if (enc_cfg.is_encryption_enabled()
-                and enc_cfg.get_encryption_method() == "password"):
-            dlg = _PasswordDialog()
-            if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.password_value:
-                _show_error(None, "Error", "Password is required.")
-                return 1
-            password = dlg.password_value
+        password_required = (
+            enc_cfg.is_encryption_enabled()
+            and enc_cfg.get_encryption_method() == "password"
+        )
     except Exception as exc:
         crash_path = diagnostics.report_exception(
             "Loading encryption settings",
@@ -10113,71 +10222,82 @@ def main(icon_path: str | None = None) -> int:
         )
         return 1
 
-    try:
-        diagnostics.set_startup_stage("initializing account manager")
-        manager = RobloxAccountManager(password=password)
-    except AccountPasswordError as exc:
-        print(f"[ERROR] ACCOUNT_PASSWORD_INVALID: {exc}")
-        _show_error(
-            None,
-            "Invalid Password",
-            "The password could not unlock the encrypted account data. "
-            "Please try again.\n\n"
-            "Error code: ACCOUNT_PASSWORD_INVALID",
-        )
-        return 1
-    except PasswordRequiredError as exc:
-        print(f"[ERROR] ACCOUNT_PASSWORD_REQUIRED: {exc}")
-        _show_error(
-            None,
-            "Password Required",
-            "A password is required to open the encrypted account data.\n\n"
-            "Error code: ACCOUNT_PASSWORD_REQUIRED",
-        )
-        return 1
-    except HardwareAccountDecryptionError as exc:
-        crash_path = diagnostics.report_exception(
-            "Opening hardware-encrypted account data",
-            exc,
-            fatal=True,
-        )
-        _show_error(
-            None,
-            "Hardware Encryption Error",
-            "The hardware-encrypted account data could not be opened on "
-            "this computer. The original file was not changed.\n\n"
-            "Error code: ACCOUNT_HARDWARE_DECRYPTION_FAILED\n\n"
-            f"Details were saved to:\n{crash_path}",
-        )
-        return 1
-    except AccountDataError as exc:
-        crash_path = diagnostics.report_exception(
-            "Loading saved account data",
-            exc,
-            fatal=True,
-        )
-        _show_error(
-            None,
-            "Account Data Error",
-            "The saved account data could not be loaded. The original "
-            "file was not changed.\n\n"
-            "Error code: ACCOUNT_DATA_INVALID\n\n"
-            f"Details were saved to:\n{crash_path}",
-        )
-        return 1
-    except Exception as exc:
-        crash_path = diagnostics.report_exception(
-            "Initializing account manager",
-            exc,
-            fatal=True,
-        )
-        _show_error(
-            None,
-            "Account Manager Could Not Start",
-            "The account data could not be loaded.\n\n"
-            f"Details were saved to:\n{crash_path}",
-        )
-        return 1
+    for attempt in range(_PASSWORD_ATTEMPTS):
+        if password_required:
+            dlg = _PasswordDialog()
+            if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.password_value:
+                _show_error(None, "Error", "Password is required.")
+                return 1
+            password = dlg.password_value
+        try:
+            diagnostics.set_startup_stage("initializing account manager")
+            manager = RobloxAccountManager(password=password)
+            break
+        except AccountPasswordError as exc:
+            print(f"[ERROR] ACCOUNT_PASSWORD_INVALID: {exc}")
+            remaining = _PASSWORD_ATTEMPTS - attempt - 1
+            _show_error(
+                None,
+                "Invalid Password",
+                "The password could not unlock the encrypted account data."
+                + (f" {remaining} attempt(s) left." if remaining else "")
+                + "\n\nError code: ACCOUNT_PASSWORD_INVALID",
+            )
+            if remaining:
+                continue
+            return 1
+        except PasswordRequiredError as exc:
+            print(f"[ERROR] ACCOUNT_PASSWORD_REQUIRED: {exc}")
+            _show_error(
+                None,
+                "Password Required",
+                "A password is required to open the encrypted account data.\n\n"
+                "Error code: ACCOUNT_PASSWORD_REQUIRED",
+            )
+            return 1
+        except HardwareAccountDecryptionError as exc:
+            crash_path = diagnostics.report_exception(
+                "Opening hardware-encrypted account data",
+                exc,
+                fatal=True,
+            )
+            _show_error(
+                None,
+                "Hardware Encryption Error",
+                "The hardware-encrypted account data could not be opened on "
+                "this computer. The original file was not changed.\n\n"
+                "Error code: ACCOUNT_HARDWARE_DECRYPTION_FAILED\n\n"
+                f"Details were saved to:\n{crash_path}",
+            )
+            return 1
+        except AccountDataError as exc:
+            crash_path = diagnostics.report_exception(
+                "Loading saved account data",
+                exc,
+                fatal=True,
+            )
+            _show_error(
+                None,
+                "Account Data Error",
+                "The saved account data could not be loaded. The original "
+                "file was not changed.\n\n"
+                "Error code: ACCOUNT_DATA_INVALID\n\n"
+                f"Details were saved to:\n{crash_path}",
+            )
+            return 1
+        except Exception as exc:
+            crash_path = diagnostics.report_exception(
+                "Initializing account manager",
+                exc,
+                fatal=True,
+            )
+            _show_error(
+                None,
+                "Account Manager Could Not Start",
+                "The account data could not be loaded.\n\n"
+                f"Details were saved to:\n{crash_path}",
+            )
+            return 1
 
     if not icon_path or not os.path.exists(icon_path):
         icon_path = os.path.join(get_data_dir(), "icon.ico")
@@ -10210,6 +10330,7 @@ def main(icon_path: str | None = None) -> int:
         )
         return 1
 
+    _listen_for_other_instances(window)
     window.show()
     diagnostics.mark_ui_ready()
     return app.exec()

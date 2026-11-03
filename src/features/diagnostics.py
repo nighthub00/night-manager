@@ -52,6 +52,14 @@ _REDACTION_PATTERNS = (
         r"\1[REDACTED]",
     ),
     (
+        re.compile(r"(?i)([?&](?:code|linkCode|accessCode)=)[^&\s\"']+"),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(r"(?i)(gameinfo:)[^+\s\"']+"),
+        r"\1[REDACTED]",
+    ),
+    (
         re.compile(r"https://(?:canary\.)?discord(?:app)?\.com/api/webhooks/[^\s\"']+"),
         "[REDACTED DISCORD WEBHOOK]",
     ),
@@ -358,6 +366,46 @@ def _handle_thread_exception(args) -> None:
     )
 
 
+_KEEP_SESSION_LOGS = 30
+_KEEP_REPORT_DAYS = 30
+
+
+def _prune_old_logs(data_dir: str) -> None:
+    # Every launch writes a new session log; without pruning they pile up forever.
+    log_dir = os.path.join(data_dir, "logs")
+    try:
+        names = os.listdir(log_dir)
+    except OSError:
+        names = []
+    sessions = sorted(
+        (name for name in names if name.startswith("session-") and name.endswith(".log")),
+        reverse=True,
+    )
+    doomed = [os.path.join(log_dir, name) for name in sessions[_KEEP_SESSION_LOGS:]]
+    cutoff = time.time() - _KEEP_REPORT_DAYS * 86400
+    report_dirs = (
+        (log_dir, ("hang-", "update-")),
+        (os.path.join(data_dir, "crash_logs"), ("crash-",)),
+    )
+    for folder, prefixes in report_dirs:
+        try:
+            entries = os.listdir(folder)
+        except OSError:
+            continue
+        for name in entries:
+            path = os.path.join(folder, name)
+            try:
+                if name.startswith(prefixes) and os.path.getmtime(path) < cutoff:
+                    doomed.append(path)
+            except OSError:
+                pass
+    for path in doomed:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def install(app_version: str) -> str:
     global _APP_VERSION
     global _INSTALLED
@@ -376,6 +424,7 @@ def install(app_version: str) -> str:
     data_dir = _get_diagnostics_root()
     log_dir = os.path.join(data_dir, "logs")
     os.makedirs(log_dir, exist_ok=True)
+    _prune_old_logs(data_dir)
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     _SESSION_LOG_PATH = os.path.join(log_dir, f"session-{stamp}.log")
     try:

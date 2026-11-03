@@ -3,6 +3,7 @@ Roblox API interaction utilities
 Handles authentication, info, and game launching
 """
 
+import hashlib
 import os
 import re
 import time
@@ -11,9 +12,38 @@ import requests
 import subprocess
 import shutil
 import threading
+from http.cookiejar import DefaultCookiePolicy
 from pathlib import Path
 
 from .operation_result import OperationResult, unexpected_result
+
+_THREAD_LOCAL = threading.local()
+_CSRF_TTL_SECONDS = 600
+_CSRF_LOCK = threading.Lock()
+_CSRF_CACHE: dict[str, tuple[float, str]] = {}
+
+
+def _http() -> requests.Session:
+    # A pooled session per thread skips a TLS handshake on every call (~40% faster).
+    # It never stores cookies: Roblox answers with Set-Cookie, and a shared jar would
+    # send one account's cookies along with another account's requests.
+    session = getattr(_THREAD_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.cookies.set_policy(DefaultCookiePolicy(allowed_domains=[]))
+        _THREAD_LOCAL.session = session
+    return session
+
+
+def _cookie_key(cookie) -> str:
+    return hashlib.sha256(str(cookie or "").encode("utf-8")).hexdigest()
+
+
+def _remember_csrf(cookie, token) -> None:
+    if token:
+        with _CSRF_LOCK:
+            _CSRF_CACHE[_cookie_key(cookie)] = (time.monotonic(), token)
+
 
 class RobloxAPI:
     """Handles all Roblox API interactions"""
@@ -147,7 +177,7 @@ class RobloxAPI:
                 {"code": code, "type": "Server"},
             ]:
                 try:
-                    api_resp = requests.post(
+                    api_resp = _http().post(
                         "https://apis.roblox.com/sharelinks/v1/resolve-link",
                         json=payload, headers=api_headers, timeout=10
                     )
@@ -163,7 +193,7 @@ class RobloxAPI:
                             return pid_m.group(1), lc_m.group(1)
                     elif api_resp.status_code == 403 and 'x-csrf-token' in api_resp.headers:
                         api_headers['X-CSRF-TOKEN'] = api_resp.headers['x-csrf-token']
-                        retry = requests.post(
+                        retry = _http().post(
                             "https://apis.roblox.com/sharelinks/v1/resolve-link",
                             json=payload, headers=api_headers, timeout=10
                         )
@@ -192,7 +222,7 @@ class RobloxAPI:
                 'Cookie': f'.ROBLOSECURITY={roblosecurity_cookie}'
             }
             
-            response = requests.get(
+            response = _http().get(
                 'https://users.roblox.com/v1/users/authenticated',
                 headers=headers,
                 timeout=3
@@ -221,7 +251,7 @@ class RobloxAPI:
         
         try:
             place_url = f"https://apis.roblox.com/universes/v1/places/{place_id}/universe"
-            place_response = requests.get(place_url, timeout=5)
+            place_response = _http().get(place_url, timeout=5)
             
             if place_response.status_code == 200:
                 place_data = place_response.json()
@@ -229,7 +259,7 @@ class RobloxAPI:
                 
                 if universe_id:
                     game_url = f"https://games.roblox.com/v1/games?universeIds={universe_id}"
-                    game_response = requests.get(game_url, timeout=5)
+                    game_response = _http().get(game_url, timeout=5)
                     
                     if game_response.status_code == 200:
                         game_data = game_response.json()
@@ -240,17 +270,27 @@ class RobloxAPI:
         return None
     
     @staticmethod
-    def get_csrf_token(cookie):
+    def get_csrf_token(cookie, refresh=False):
         """Get CSRF token for authenticated requests"""
+        # Tokens stay valid for a while, so presence polling no longer spends an
+        # extra request per check; callers refresh on a 403 that carries a new one.
+        if not refresh:
+            with _CSRF_LOCK:
+                cached = _CSRF_CACHE.get(_cookie_key(cookie))
+            if cached and time.monotonic() - cached[0] < _CSRF_TTL_SECONDS:
+                return cached[1]
+
         url = "https://auth.roblox.com/v2/logout"
         headers = {
             'Cookie': f'.ROBLOSECURITY={cookie}'
         }
-        
+
         try:
-            response = requests.post(url, headers=headers, timeout=5)
-            return response.headers.get('x-csrf-token')
-        except:
+            response = _http().post(url, headers=headers, timeout=5)
+            token = response.headers.get('x-csrf-token')
+            _remember_csrf(cookie, token)
+            return token
+        except Exception:
             return None
     
     
@@ -272,7 +312,7 @@ class RobloxAPI:
             try:
                 RobloxAPI._wait_for_rate_limit()
                 
-                response = requests.post(url, json=payload, timeout=5)
+                response = _http().post(url, json=payload, timeout=5)
                 
                 if response.status_code == 200:
                     data = response.json()
@@ -322,7 +362,7 @@ class RobloxAPI:
         """Get username from user ID using Roblox API"""
         try:
             url = f"https://users.roblox.com/v1/users/{user_id}"
-            response = requests.get(url, timeout=5)
+            response = _http().get(url, timeout=5)
             
             if response.status_code == 200:
                 data = response.json()
@@ -355,8 +395,14 @@ class RobloxAPI:
         }
         
         try:
-            response = requests.post(url, headers=headers, json=payload, timeout=5)
-            
+            response = _http().post(url, headers=headers, json=payload, timeout=5)
+            fresh_token = response.headers.get('x-csrf-token')
+            if response.status_code == 403 and fresh_token:
+                # The cached token expired; Roblox sent its replacement.
+                _remember_csrf(cookie, fresh_token)
+                headers['X-CSRF-TOKEN'] = fresh_token
+                response = _http().post(url, headers=headers, json=payload, timeout=5)
+
             if response.status_code == 200:
                 data = response.json()
                 if data.get('userPresences') and len(data['userPresences']) > 0:
@@ -405,7 +451,7 @@ class RobloxAPI:
         try:
             csrf_token = ""
             for attempt in range(4):
-                response = requests.post(url, headers=headers, timeout=8)
+                response = _http().post(url, headers=headers, timeout=8)
                 if response.status_code == 403 and response.headers.get("x-csrf-token"):
                     csrf_token = response.headers["x-csrf-token"]
                     break
@@ -447,7 +493,7 @@ class RobloxAPI:
 
             headers["X-CSRF-TOKEN"] = csrf_token
             for attempt in range(4):
-                response = requests.post(url, headers=headers, timeout=8)
+                response = _http().post(url, headers=headers, timeout=8)
                 if response.status_code == 200:
                     auth_ticket = response.headers.get("rbx-authentication-ticket")
                     if auth_ticket:
@@ -830,7 +876,7 @@ class RobloxAPI:
             headers = {
                 'Cookie': f'.ROBLOSECURITY={cookie}'
             }
-            response = requests.get(
+            response = _http().get(
                 'https://users.roblox.com/v1/users/authenticated',
                 headers=headers,
                 timeout=8

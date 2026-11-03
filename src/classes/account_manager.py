@@ -7,7 +7,6 @@ import os
 import json
 import time
 import tempfile
-import hashlib
 import shutil
 import traceback
 import threading
@@ -24,6 +23,7 @@ from .encryption import (
 from .operation_result import OperationResult, unexpected_result
 from .roblox_api import RobloxAPI
 from utils.app_paths import get_data_dir
+from utils.atomic_file import write_json_atomic
 
 class AccountManagerStartupError(Exception):
     pass
@@ -40,24 +40,78 @@ class HardwareAccountDecryptionError(AccountManagerStartupError):
 class AccountDataError(AccountManagerStartupError):
     pass
 
+_ACCOUNTS_FILE_NAME = "saved_accounts.json"
+_ENCRYPTION_CONFIG_NAME = "encryption_config.json"
+_SWITCH_BACKUP_DIR = ".encryption_switch_backup"
+_SWITCH_BACKUP_COMPLETE = "complete"
+_STALE_LOGIN_PROFILE_SECONDS = 3600
+
+
+def recover_interrupted_encryption_switch(data_folder=None):
+    """Put back the account file and its encryption config if a method switch died halfway.
+
+    The two files are rewritten one after the other. A crash between them would leave
+    accounts encrypted with a key the config no longer describes, so the switch copies
+    both first and only deletes the copies once both writes are done.
+    """
+    data_folder = data_folder or get_data_dir()
+    backup_dir = os.path.join(data_folder, _SWITCH_BACKUP_DIR)
+    if not os.path.isdir(backup_dir):
+        return False
+    restored = False
+    if os.path.exists(os.path.join(backup_dir, _SWITCH_BACKUP_COMPLETE)):
+        for name in (_ACCOUNTS_FILE_NAME, _ENCRYPTION_CONFIG_NAME):
+            backup = os.path.join(backup_dir, name)
+            target = os.path.join(data_folder, name)
+            if os.path.exists(backup):
+                os.replace(backup, target)
+            elif os.path.exists(target):
+                # The file did not exist before the switch started.
+                os.remove(target)
+        restored = True
+        print("[WARNING] An interrupted encryption switch was rolled back.")
+    shutil.rmtree(backup_dir, ignore_errors=True)
+    return restored
+
+
+def cleanup_stale_login_profiles():
+    # Browser login profiles hold a signed-in .ROBLOSECURITY cookie. A crash during
+    # login leaves them in %TEMP%, so remove any that outlived the 5 minute login window.
+    temp_root = tempfile.gettempdir()
+    cutoff = time.time() - _STALE_LOGIN_PROFILE_SECONDS
+    try:
+        names = os.listdir(temp_root)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith("roblox_login_"):
+            continue
+        path = os.path.join(temp_root, name)
+        try:
+            if os.path.isdir(path) and os.path.getmtime(path) < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
+
+
 class RobloxAccountManager:
-    
+
     def __init__(self, password=None):
         self.data_folder = get_data_dir()
         if not os.path.exists(self.data_folder):
             os.makedirs(self.data_folder)
-        
-        self.accounts_file = os.path.join(self.data_folder, "saved_accounts.json")
-        self.encryption_config = EncryptionConfig(os.path.join(self.data_folder, "encryption_config.json"))
+        recover_interrupted_encryption_switch(self.data_folder)
+
+        self.accounts_file = os.path.join(self.data_folder, _ACCOUNTS_FILE_NAME)
+        self.encryption_config = EncryptionConfig(os.path.join(self.data_folder, _ENCRYPTION_CONFIG_NAME))
         self.encryptor = None
         self.secure_settings = {}
         self._secure_settings_encryptor = None
         self._unavailable_secure_settings = None
-        self._entered_password_hash = None
         self._accounts_lock = threading.RLock()
         self._browser_setup_lock = threading.Lock()
         self._pre_launch_hook = None
-        
+
         if self.encryption_config.is_encryption_enabled():
             method = self.encryption_config.get_encryption_method()
             if method == 'hardware':
@@ -67,7 +121,6 @@ class RobloxAccountManager:
                     raise PasswordRequiredError(
                         "Password is required for password-based encryption."
                     )
-                self._entered_password_hash = hashlib.sha256(password.encode()).hexdigest()
                 salt = self.encryption_config.get_salt()
                 if not salt:
                     raise AccountDataError(
@@ -129,7 +182,6 @@ class RobloxAccountManager:
 
                 accounts = self._extract_accounts_payload(decrypted_data)
                 self._migrate_accounts(accounts)
-                self._repair_password_hash_if_needed()
                 return accounts
 
             accounts = self._extract_accounts_payload(data)
@@ -137,20 +189,6 @@ class RobloxAccountManager:
             return accounts
         self.secure_settings = {}
         return {}
-
-    def _repair_password_hash_if_needed(self):
-        if not self._entered_password_hash:
-            return
-        stored_hash = self.encryption_config.get_password_hash()
-        if stored_hash == self._entered_password_hash:
-            return
-        if self.encryption_config.get_encryption_method() != 'password':
-            return
-        self.encryption_config.config['password_hash'] = self._entered_password_hash
-        try:
-            self.encryption_config.save_config()
-        except Exception:
-            pass
 
     def _extract_accounts_payload(self, data):
         """Support legacy account-only files and wrapped account+secure-settings files."""
@@ -229,37 +267,12 @@ class RobloxAccountManager:
             'accounts': self.accounts,
             'secure_settings': self._serialize_secure_settings(),
         }
-        temp_file = self.accounts_file + ".tmp"
-        try:
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                if self.encryptor:
-                    encrypted_package = self.encryptor.encrypt_data(payload)
-                    encrypted_data = {
-                        'encrypted': True,
-                        'data': encrypted_package
-                    }
-                    json.dump(encrypted_data, f, indent=2, ensure_ascii=False)
-                else:
-                    json.dump(payload, f, indent=2, ensure_ascii=False)
-            os.replace(temp_file, self.accounts_file)
-        except Exception as e:
-            print(f"[WARNING] Safe atomic save failed: {e}. Falling back to original direct write.")
-            if os.path.exists(temp_file):
-                try:
-                    os.remove(temp_file)
-                except:
-                    pass
-            # Original direct write fallback
-            with open(self.accounts_file, 'w', encoding='utf-8') as f:
-                if self.encryptor:
-                    encrypted_package = self.encryptor.encrypt_data(payload)
-                    encrypted_data = {
-                        'encrypted': True,
-                        'data': encrypted_package
-                    }
-                    json.dump(encrypted_data, f, indent=2, ensure_ascii=False)
-                else:
-                    json.dump(payload, f, indent=2, ensure_ascii=False)
+        if self.encryptor:
+            payload = {
+                'encrypted': True,
+                'data': self.encryptor.encrypt_data(payload),
+            }
+        write_json_atomic(self.accounts_file, payload)
 
     def get_secure_setting(self, key, default=""):
         """Read a sensitive setting stored alongside encrypted account data."""
@@ -816,33 +829,37 @@ class RobloxAccountManager:
                     failures.append(setup_result)
                     continue
                 driver = setup_result.data
-                
-                window_width = 500
-                window_height = 600
-                
-                screen_width = driver.execute_script("return screen.width;")
-                screen_height = driver.execute_script("return screen.height;")
-                
-                position_count = window_slot_count or amount
-                position_index = window_slot if window_slot is not None else i
-                grid_cols = min(3, position_count)
-                grid_rows = (position_count + grid_cols - 1) // grid_cols
-                
-                col = position_index % grid_cols
-                row = position_index // grid_cols
-                
-                x = col * (screen_width // grid_cols) + 10
-                y = row * ((screen_height - 100) // grid_rows) + 10
-                
-                driver.set_window_position(x, y)
-                driver.set_window_size(window_width, window_height)
-                
+                # Track the driver before touching it, so every later failure still
+                # quits the browser and deletes its signed-in temp profile.
                 drivers.append(driver)
                 instance_passwords.append(
                     password_list[i]
                     if password_list and i < len(password_list)
                     else ""
                 )
+
+                window_width = 500
+                window_height = 600
+
+                try:
+                    screen_width = driver.execute_script("return screen.width;")
+                    screen_height = driver.execute_script("return screen.height;")
+
+                    position_count = window_slot_count or amount
+                    position_index = window_slot if window_slot is not None else i
+                    grid_cols = min(3, position_count)
+                    grid_rows = (position_count + grid_cols - 1) // grid_cols
+
+                    col = position_index % grid_cols
+                    row = position_index // grid_cols
+
+                    x = col * (screen_width // grid_cols) + 10
+                    y = row * ((screen_height - 100) // grid_rows) + 10
+
+                    driver.set_window_position(x, y)
+                    driver.set_window_size(window_width, window_height)
+                except Exception as e:
+                    print(f"[WARNING] Could not position browser instance {i + 1}: {e}")
                 
                 try:
                     print(f"[INFO] Opening {website} (instance {i + 1}/{amount})...")
@@ -1087,14 +1104,14 @@ class RobloxAccountManager:
 
     def delete_account(self, username):
         """Delete a saved account"""
-        if username in self.accounts:
+        with self._accounts_lock:
+            if username not in self.accounts:
+                print(f"[ERROR] Account '{username}' not found")
+                return False
             del self.accounts[username]
             self.save_accounts()
-            print(f"[SUCCESS] Deleted account: {username}")
-            return True
-        else:
-            print(f"[ERROR] Account '{username}' not found")
-            return False
+        print(f"[SUCCESS] Deleted account: {username}")
+        return True
     
     def launch_roblox(self, username, game_id="", private_server_id="", launcher_preference="default", job_id="", custom_launcher_path=""):
         """Launch Roblox game with specified account"""
@@ -1152,12 +1169,12 @@ class RobloxAccountManager:
 
     def set_account_note(self, username, note):
         """Set or update note for an account"""
-        if username not in self.accounts:
-            print(f"[ERROR] Account '{username}' not found")
-            return False
-        
-        self.accounts[username]['note'] = note
-        self.save_accounts()
+        with self._accounts_lock:
+            if username not in self.accounts:
+                print(f"[ERROR] Account '{username}' not found")
+                return False
+            self.accounts[username]['note'] = note
+            self.save_accounts()
         print(f"[SUCCESS] Note updated for account: {username}")
         return True
     
@@ -1182,29 +1199,44 @@ class RobloxAccountManager:
         if current_method == new_method:
             print("[INFO] Already using this encryption method")
             return
+        if new_method == 'password' and password is None:
+            raise ValueError("Password must be provided for password encryption")
 
-        current_data = self.accounts.copy()
+        with self._accounts_lock:
+            # Copy both files first; recover_interrupted_encryption_switch() puts them
+            # back if this fails or the process dies before both writes finish.
+            backup_dir = os.path.join(self.data_folder, _SWITCH_BACKUP_DIR)
+            shutil.rmtree(backup_dir, ignore_errors=True)
+            os.makedirs(backup_dir)
+            for name in (_ACCOUNTS_FILE_NAME, _ENCRYPTION_CONFIG_NAME):
+                source = os.path.join(self.data_folder, name)
+                if os.path.exists(source):
+                    shutil.copy2(source, os.path.join(backup_dir, name))
+            with open(os.path.join(backup_dir, _SWITCH_BACKUP_COMPLETE), 'w', encoding='utf-8') as f:
+                f.write(current_method)
 
-        self.encryption_config.reset_encryption()
-
-        if new_method == 'hardware':
-            self.encryption_config.set_encryption_method('hardware')
-            self.encryptor = HardwareEncryption()
-            self._entered_password_hash = None
-        elif new_method == 'password':
-            if password is None:
-                raise ValueError("Password must be provided for password encryption")
-            if salt is None:
-                salt = os.urandom(32).hex()
-            password_hash = hashlib.sha256(password.encode()).hexdigest()
-            self.encryption_config.enable_password_encryption(salt, password_hash)
-            self._entered_password_hash = password_hash
-            self.encryptor = PasswordEncryption(password, salt)
-        else:  # 'none'
-            self.encryption_config.disable_encryption()
-            self.encryptor = None
-            self._entered_password_hash = None
-
-        self.accounts = current_data
-        self.save_accounts()
+            old_config = dict(self.encryption_config.config)
+            old_encryptor = self.encryptor
+            try:
+                self.encryption_config.reset_encryption()
+                if new_method == 'hardware':
+                    self.encryption_config.set_encryption_method('hardware')
+                    self.encryptor = HardwareEncryption()
+                elif new_method == 'password':
+                    encryptor = PasswordEncryption(password, salt)
+                    self.encryption_config.enable_password_encryption(encryptor.get_salt_b64())
+                    self.encryptor = encryptor
+                else:  # 'none'
+                    self.encryption_config.disable_encryption()
+                    self.encryptor = None
+                self._save_accounts_unlocked()
+            except BaseException:
+                self.encryptor = old_encryptor
+                self.encryption_config.config = old_config
+                try:
+                    recover_interrupted_encryption_switch(self.data_folder)
+                except Exception as exc:
+                    print(f"[ERROR] Could not roll back the encryption switch: {exc}")
+                raise
+            shutil.rmtree(backup_dir, ignore_errors=True)
         print(f"[SUCCESS] Switched to {new_method} encryption")

@@ -5,6 +5,7 @@ Core logic for auto-rejoin purposes.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import subprocess
@@ -18,6 +19,7 @@ from classes.roblox_api import RobloxAPI
 import features.presence as presence_mod
 import features.settings_store as settings_store
 from utils.app_paths import get_data_dir
+from utils.atomic_file import write_json_atomic
 
 _CONFIG_FILE = os.path.join(get_data_dir(), "auto_rejoin.json")
 _CONFIG_LOCK = threading.RLock()
@@ -25,7 +27,7 @@ _CONFIG_CACHE: dict | None = None
 _INTERNET_LOCK = threading.Lock()
 _INTERNET_CACHE = (0.0, False)
 _PID_UID_LOCK = threading.Lock()
-_PID_UID_CACHE: dict[tuple[int, float], str] = {}
+_PID_UID_CACHE: dict[tuple[int, float], tuple[str, str]] = {} # identity -> (user_id, log_path)
 _LAUNCH_LOCK = threading.Lock()
 
 RobloxProcessIdentity = tuple[int, float]
@@ -44,7 +46,9 @@ def load_configs() -> dict:
                 except (OSError, ValueError, TypeError):
                     pass
             _CONFIG_CACHE = data
-        return dict(_CONFIG_CACHE)
+        # Deep copies: a caller editing a nested config in place must not also edit
+        # the cache, or save_configs() would see no change and skip the write.
+        return copy.deepcopy(_CONFIG_CACHE)
 
 
 def save_configs(configs: dict) -> None:
@@ -52,27 +56,11 @@ def save_configs(configs: dict) -> None:
     with _CONFIG_LOCK:
         if _CONFIG_CACHE == configs:
             return
-    os.makedirs(get_data_dir(), exist_ok=True)
-    temp_file = _CONFIG_FILE + ".tmp"
-    try:
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(configs, f, indent=2)
-        os.replace(temp_file, _CONFIG_FILE)
-        with _CONFIG_LOCK:
-            _CONFIG_CACHE = dict(configs)
-    except Exception as e:
-        print(f"[WARNING] Safe configs save failed: {e}. Falling back to original direct write.")
-        if os.path.exists(temp_file):
-            try:
-                os.remove(temp_file)
-            except:
-                pass
-        # Original direct write fallback
         try:
-            with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(configs, f, indent=2)
-        except Exception:
-            pass
+            write_json_atomic(_CONFIG_FILE, configs)
+            _CONFIG_CACHE = copy.deepcopy(configs)
+        except Exception as e:
+            print(f"[ERROR] Auto-Rejoin settings could not be saved: {e}")
 
 def _has_internet(timeout: int = 3) -> bool:
     global _INTERNET_CACHE
@@ -191,22 +179,23 @@ def scan_pid_uid_map(
         (pid, process_data[0])
         for pid, process_data in current_processes.items()
     }
-    used_logs: set[str] = set()
-
     with _PID_UID_LOCK:
         stale = set(_PID_UID_CACHE) - current_identities
         for identity in stale:
             _PID_UID_CACHE.pop(identity, None)
 
+        # Keep logs of already-resolved processes claimed so a newer client
+        # can't be matched to another account's log.
+        used_logs: set[str] = {path for _, path in _PID_UID_CACHE.values()}
         for identity in sorted(current_identities, key=lambda item: item[1]):
             if identity in _PID_UID_CACHE:
                 continue
-            uid = presence_mod._get_user_id_from_pid(identity[0], used_logs)
-            if uid:
-                _PID_UID_CACHE[identity] = str(uid)
+            entry = presence_mod._get_log_entry_from_pid(identity[0], used_logs)
+            if entry:
+                _PID_UID_CACHE[identity] = (str(entry.user_id), entry.path)
 
         result: dict[str, set[RobloxProcessIdentity]] = {}
-        for identity, uid in _PID_UID_CACHE.items():
+        for identity, (uid, _) in _PID_UID_CACHE.items():
             if uid in wanted_user_ids:
                 result.setdefault(uid, set()).add(identity)
 
@@ -302,6 +291,11 @@ class AutoRejoinWorker:
         base = max(3, int(seconds))
         jitter = random.uniform(0.2, min(1.5, base * 0.2))
         return self._stop.wait(base + jitter)
+
+    def _current_cookie(self, fallback: str) -> str:
+        # Re-read so a cookie re-imported while monitoring is picked up.
+        data = self.manager.accounts.get(self.account)
+        return (data.get("cookie") if isinstance(data, dict) else "") or fallback
 
     def _can_launch(self) -> bool:
         if not self.config.get("check_internet", True):
@@ -528,7 +522,7 @@ class AutoRejoinWorker:
                 if check_presence:
                     presence_state, gid = self._is_in_game(
                         user_id,
-                        cookie,
+                        self._current_cookie(cookie),
                         place_id,
                         check_place_id,
                     )

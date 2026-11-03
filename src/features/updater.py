@@ -5,6 +5,7 @@ Core logic of update checker.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -32,6 +33,31 @@ RELEASE_ASSET_PATTERN = re.compile(
 )
 PROCESS_WAIT_SECONDS = 120
 REPLACE_WAIT_SECONDS = 30
+UPDATE_DIR_PREFIX = "night_manager_update_"
+STALE_UPDATE_SECONDS = 3600
+
+
+def cleanup_stale_update_dirs() -> None:
+    """Delete update downloads left in %TEMP% by a closed, killed or failed update.
+
+    The installer lives at most a few minutes, so anything older than an hour is
+    an orphan (each one can hold a full 75 MB copy of the app).
+    """
+    temp_root = tempfile.gettempdir()
+    cutoff = time.time() - STALE_UPDATE_SECONDS
+    try:
+        names = os.listdir(temp_root)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith(UPDATE_DIR_PREFIX):
+            continue
+        path = os.path.join(temp_root, name)
+        try:
+            if os.path.isdir(path) and os.path.getmtime(path) < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
 
 def _clean(version: str) -> str:
     """Strip alpha/beta suffixes so we compare only numeric parts."""
@@ -61,7 +87,8 @@ def check_latest_version() -> str | None:
         return None
 
 
-def get_exe_download_url() -> tuple[str, str] | None:
+def get_exe_download_url() -> tuple[str, str, str] | None:
+    """(download url, asset name, expected sha256 hex or "") for the latest release exe."""
     try:
         response = requests.get(GITHUB_API, timeout=8)
         response.raise_for_status()
@@ -95,7 +122,9 @@ def get_exe_download_url() -> tuple[str, str] | None:
         )
         if not selected:
             return None
-        return selected["browser_download_url"], selected["name"]
+        digest = str(selected.get("digest") or "")
+        sha256 = digest[len("sha256:"):].lower() if digest.lower().startswith("sha256:") else ""
+        return selected["browser_download_url"], selected["name"], sha256
     except Exception as exc:
         print(f"[ERROR] get_exe_download_url error: {exc}")
         return None
@@ -157,12 +186,20 @@ function Write-UpdateFailure([string]$Message) {{
     }}
 }}
 
+function Get-RunningCopies {{
+    # Any other process still running the exe keeps it locked, not just the one that asked for the update.
+    Get-Process -ErrorAction SilentlyContinue | Where-Object {{
+        try {{ $_.Path -and ([string]::Equals($_.Path, $DestinationPath, [StringComparison]::OrdinalIgnoreCase)) }} catch {{ $false }}
+    }}
+}}
+
 try {{
     $exitDeadline = [DateTime]::UtcNow.AddSeconds({PROCESS_WAIT_SECONDS})
     while ((Get-Process -Id $TargetProcessId -ErrorAction SilentlyContinue) -or
-           ($LauncherProcessId -and (Get-Process -Id $LauncherProcessId -ErrorAction SilentlyContinue))) {{
+           ($LauncherProcessId -and (Get-Process -Id $LauncherProcessId -ErrorAction SilentlyContinue)) -or
+           (Get-RunningCopies)) {{
         if ([DateTime]::UtcNow -ge $exitDeadline) {{
-            throw "The running application did not exit within {PROCESS_WAIT_SECONDS} seconds."
+            throw "NIGHT MANAGER is still running in another window or the system tray. Close it to finish the update."
         }}
         Start-Sleep -Milliseconds 500
     }}
@@ -190,9 +227,7 @@ try {{
         }}
     }}
 
-    Remove-Item -LiteralPath $SourcePath -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $UpdateDirectory -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $UpdateDirectory -Recurse -Force -ErrorAction SilentlyContinue
     if ($Relaunch) {{
         Start-Process -FilePath $DestinationPath -WorkingDirectory (Split-Path -Parent $DestinationPath)
     }}
@@ -203,8 +238,10 @@ try {{
     $detail += "Destination: $DestinationPath`r`n"
     $detail += "Error: $($_.Exception.Message)"
     Write-UpdateFailure $detail
+    # The next launch downloads a fresh copy, so don't leave this one in %TEMP%
+    Remove-Item -LiteralPath $UpdateDirectory -Recurse -Force -ErrorAction SilentlyContinue
     # Bring the current version back so a failed update never leaves the user with nothing open
-    if ($Relaunch -and (Test-Path -LiteralPath $DestinationPath -PathType Leaf)) {{
+    if ($Relaunch -and (Test-Path -LiteralPath $DestinationPath -PathType Leaf) -and -not (Get-RunningCopies)) {{
         Start-Process -FilePath $DestinationPath -WorkingDirectory (Split-Path -Parent $DestinationPath)
     }}
     exit 1
@@ -277,23 +314,25 @@ def _download_release(on_progress: Callable[[int], None]) -> dict:
     if not result:
         raise RuntimeError(f"No {APP_NAME} executable was found in the latest release.")
 
-    url, filename = result
+    url, filename, expected_sha256 = result
     print(f"[INFO] Downloading {filename} from {url}")
     on_progress(2)
 
-    update_directory = tempfile.mkdtemp(prefix="night_manager_update_")
+    update_directory = tempfile.mkdtemp(prefix=UPDATE_DIR_PREFIX)
     source_path = os.path.join(update_directory, "update.exe")
     try:
         response = requests.get(url, stream=True, timeout=60)
         response.raise_for_status()
         total = int(response.headers.get("content-length", 0))
         downloaded = 0
+        digest = hashlib.sha256()
 
         with open(source_path, "wb") as handle:
             for chunk in response.iter_content(chunk_size=65536):
                 if not chunk:
                     continue
                 handle.write(chunk)
+                digest.update(chunk)
                 downloaded += len(chunk)
                 if total > 0:
                     on_progress(int(2 + (downloaded / total) * 95))
@@ -302,6 +341,10 @@ def _download_release(on_progress: Callable[[int], None]) -> dict:
             raise RuntimeError("The downloaded update file is empty.")
         if total > 0 and os.path.getsize(source_path) != total:
             raise RuntimeError("The download was cut off before it finished.")
+        if expected_sha256 and digest.hexdigest() != expected_sha256:
+            raise RuntimeError(
+                "The downloaded file does not match the release checksum. The update was refused."
+            )
 
         product_name = read_product_name(source_path)
         if product_name != APP_NAME:

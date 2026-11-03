@@ -3,4 +3,4 @@ Application version information.
 """
 
 APP_NAME = "NIGHT MANAGER"
-APP_VERSION = "1.1.4"
+APP_VERSION = "1.1.5"
