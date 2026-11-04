@@ -55,6 +55,11 @@ jobs:
           )
         shell: cmd
 
+      - name: Sign release asset
+        run: uv run --no-sync python scripts/sign_release.py
+        env:
+          NM_RELEASE_SIGNING_KEY: ${{ secrets.NM_RELEASE_SIGNING_KEY }}
+
       - name: Create release
         uses: softprops/action-gh-release@v3
         with:
@@ -62,4 +67,6 @@ jobs:
           name: NIGHT MANAGER ${{ github.event.inputs.tag || github.ref_name }}
           generate_release_notes: true
           fail_on_unmatched_files: true
-          files: dist/NightManager-v*.exe
+          files: |
+            dist/NightManager-v*.exe
+            dist/NightManager-v*.exe.sig

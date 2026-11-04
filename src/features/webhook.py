@@ -31,6 +31,9 @@ _AR_EVENTS: list[tuple[str, str, int]] = [
     ("launch failed",      "Launch Failed",          0xE74C3C),
     ("max retries",        "Auto Rejoin Stopped",    0xE74C3C),
     ("stopped",            "Auto Rejoin Stopped",    0xE74C3C),
+    ("crashed",            "Client Crashed",         0xE74C3C),
+    ("not responding",     "Client Not Responding",  0xF39C12),
+    ("memory limit",       "Client Over Memory Limit", 0xF39C12),
     ("disconnect",         "Account Disconnected!",  0xF39C12),
 ]
 

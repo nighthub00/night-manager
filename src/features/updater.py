@@ -16,11 +16,16 @@ import threading
 import time
 from typing import Callable
 
+from urllib.parse import urlparse
+
 import psutil
 import requests
+from Crypto.Hash import SHA256
+from Crypto.PublicKey import ECC
+from Crypto.Signature import DSS
 
 from utils.app_paths import get_clean_child_env, get_data_dir
-from utils.version import APP_NAME
+from utils.version import APP_NAME, APP_VERSION
 
 # Updates come only from NIGHT MANAGER's own releases. Pointing this at the
 # upstream Evanovar RAM repository would replace this build with theirs.
@@ -31,6 +36,14 @@ RELEASE_ASSET_PATTERN = re.compile(
     r"^NightManager-v\d+\.\d+\.\d+(?:\.\d+)?\.exe$",
     re.IGNORECASE,
 )
+# Release builds are signed in CI (scripts/sign_release.py): ECDSA P-256 / SHA-256 over
+# "<asset name>\n" followed by the exe's bytes, in "<asset name>.sig". The name carries the
+# version, so an older signed build can't pass for a newer one.
+RELEASE_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAET/NlNY4d7dn9PDRoWf9rCxWyA7Hr
+RuKm05VXZGkivlzLW95ZnD99ol13wc5q4Qv8BcZjApP/yHkOFxNaLGQbSw==
+-----END PUBLIC KEY-----"""
+MAX_SIGNATURE_BYTES = 4096
 PROCESS_WAIT_SECONDS = 120
 REPLACE_WAIT_SECONDS = 30
 UPDATE_DIR_PREFIX = "night_manager_update_"
@@ -87,8 +100,9 @@ def check_latest_version() -> str | None:
         return None
 
 
-def get_exe_download_url() -> tuple[str, str, str] | None:
-    """(download url, asset name, expected sha256 hex or "") for the latest release exe."""
+def get_exe_download_url() -> tuple[str, str, str, str] | None:
+    """(download url, asset name, expected sha256 hex or "", signature url or "") for the
+    latest release exe."""
     try:
         response = requests.get(GITHUB_API, timeout=8)
         response.raise_for_status()
@@ -124,7 +138,15 @@ def get_exe_download_url() -> tuple[str, str, str] | None:
             return None
         digest = str(selected.get("digest") or "")
         sha256 = digest[len("sha256:"):].lower() if digest.lower().startswith("sha256:") else ""
-        return selected["browser_download_url"], selected["name"], sha256
+        signature = next(
+            (
+                asset.get("browser_download_url", "")
+                for asset in release.get("assets", [])
+                if str(asset.get("name", "")).lower() == selected["name"].lower() + ".sig"
+            ),
+            "",
+        )
+        return selected["browser_download_url"], selected["name"], sha256, signature
     except Exception as exc:
         print(f"[ERROR] get_exe_download_url error: {exc}")
         return None
@@ -308,13 +330,42 @@ _NOT_FROZEN_MESSAGE = (
 )
 
 
+def _is_github_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return urlparse(url).scheme == "https" and host == "github.com"
+
+
+def _download_signature(url: str) -> bytes:
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+    if len(response.content) > MAX_SIGNATURE_BYTES:
+        raise RuntimeError("The release signature is too large. The update was refused.")
+    return response.content
+
+
+def verify_signature(signed_hash, signature: bytes) -> bool:
+    """`signed_hash`: SHA256 over "<asset name>\\n" + the exe; `signature`: DER ECDSA."""
+    try:
+        verifier = DSS.new(ECC.import_key(RELEASE_PUBLIC_KEY), "fips-186-3", encoding="der")
+        verifier.verify(signed_hash, signature)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
 def _download_release(on_progress: Callable[[int], None]) -> dict:
     """Download and verify the latest release exe. Returns the staged update or raises."""
     result = get_exe_download_url()
     if not result:
         raise RuntimeError(f"No {APP_NAME} executable was found in the latest release.")
 
-    url, filename, expected_sha256 = result
+    url, filename, expected_sha256, signature_url = result
+    file_version = filename[len("NightManager-v"):-len(".exe")]
+    if not is_newer(APP_VERSION, file_version):
+        raise RuntimeError(f"The release ({file_version}) isn't newer than this build. The update was refused.")
+    if not signature_url or not _is_github_url(signature_url) or not _is_github_url(url):
+        raise RuntimeError("The release has no NIGHT MANAGER signature. The update was refused.")
+    signature = _download_signature(signature_url)
     print(f"[INFO] Downloading {filename} from {url}")
     on_progress(2)
 
@@ -326,6 +377,7 @@ def _download_release(on_progress: Callable[[int], None]) -> dict:
         total = int(response.headers.get("content-length", 0))
         downloaded = 0
         digest = hashlib.sha256()
+        signed = SHA256.new(f"{filename}\n".encode("utf-8"))
 
         with open(source_path, "wb") as handle:
             for chunk in response.iter_content(chunk_size=65536):
@@ -333,6 +385,7 @@ def _download_release(on_progress: Callable[[int], None]) -> dict:
                     continue
                 handle.write(chunk)
                 digest.update(chunk)
+                signed.update(chunk)
                 downloaded += len(chunk)
                 if total > 0:
                     on_progress(int(2 + (downloaded / total) * 95))
@@ -344,6 +397,10 @@ def _download_release(on_progress: Callable[[int], None]) -> dict:
         if expected_sha256 and digest.hexdigest() != expected_sha256:
             raise RuntimeError(
                 "The downloaded file does not match the release checksum. The update was refused."
+            )
+        if not verify_signature(signed, signature):
+            raise RuntimeError(
+                "The download doesn't carry NIGHT MANAGER's release signature. The update was refused."
             )
 
         product_name = read_product_name(source_path)

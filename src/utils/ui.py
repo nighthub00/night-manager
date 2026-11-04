@@ -9,6 +9,7 @@ import collections
 import ctypes
 from ctypes import wintypes
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -29,9 +30,11 @@ if _ROOT_DIR not in sys.path:
 
 import psutil
 import requests
+import win32con
+import win32gui
 
 from PySide6.QtCore import (
-    QByteArray, QEasingCurve, QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, QTimer, QUrl,
+    QByteArray, QEasingCurve, QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, QTime, QTimer, QUrl,
     QVariantAnimation, Signal,
 )
 from PySide6.QtGui import (
@@ -42,7 +45,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox,
     QColorDialog, QComboBox, QDialog, QFileDialog, QFrame, QGraphicsBlurEffect, QGraphicsPixmapItem, QGraphicsScene,
-    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
+    QGridLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QTimeEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMenu,
     QMessageBox, QPushButton, QRadioButton, QScrollArea,
     QSizePolicy, QDoubleSpinBox, QSlider, QSpinBox, QStackedWidget, QSystemTrayIcon,
@@ -74,21 +77,35 @@ import features.account_actions as actions
 import features.account_creator as account_creator_mod
 import features.auto_rejoin as ar
 import features.avatars as avatars
+import features.backup as backup_mod
+import features.bandwidth as bandwidth_mod
 import features.charts as charts_mod
+import features.client_history as client_history_mod
+import features.client_limits as client_limits_mod
+import features.client_tracker as client_tracker_mod
 import features.cookie_validator as cookie_validator_mod
 import features.chromium as chromium_mod
 import features.diagnostics as diagnostics
+import features.discord_alerts as discord_alerts_mod
+import features.discord_rpc as discord_rpc_mod
 import features.favorites as favorites_mod
+import features.free_resize as free_resize_mod
 import features.groups as groups
 import features.headless_manager as headless_manager_mod
+import features.launch_settings as launch_settings_mod
+import features.launch_target as launch_target_mod
+import features.perf_profiles as perf_profiles_mod
 import features.presence as presence_mod
 import features.private_servers as private_servers_mod
 import features.roblox_downloader as roblox_downloader_mod
+import features.roblox_logs as roblox_logs_mod
 import features.roblox_settings as roblox_settings_mod
+import features.roblox_update as roblox_update_mod
 import features.updater as updater_mod
 import features.webhook as webhook
 import features.websocket_server as ws_mod
 import features.window_grid as window_grid_mod
+import features.window_operations as window_operations_mod
 import features.window_renamer as window_renamer_mod
 import features.windows_startup as windows_startup_mod
 import features.themes as themes_mod
@@ -406,6 +423,10 @@ class _Bridge(QObject):
     client_count = Signal(int) # running Roblox clients from the sidebar counter
     charts_loaded = Signal(object) # dict payload from the Charts / game search worker
     chart_icon_ready = Signal(str, object) # (universe_id, png_bytes) from the game icon worker
+    link_resolved = Signal(object) # dict payload from a pasted-link resolution worker
+    clients_update = Signal(object) # list[dict] of tracked clients, every tracker tick
+    client_event = Signal(str, object) # ("joined" | "ended", client snapshot)
+    roblox_update_status = Signal(object) # dict from the Roblox version check / install
 
 
 BG = "#070A13"
@@ -464,6 +485,9 @@ _ICON_PATHS = {
     "chart": '<path d="M3 3v18h18"/><path d="m7 15 4-4 3 3 6-6"/><path d="M15 8h5v5"/>',
     "star": '<path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2L12 17.3 6.4 20.2l1.1-6.2L3 9.6l6.2-.9Z"/>',
     "copy": '<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/>',
+    "clients": '<rect x="2" y="3" width="9" height="7" rx="1.5"/><rect x="13" y="3" width="9" height="7" rx="1.5"/>'
+               '<rect x="2" y="14" width="9" height="7" rx="1.5"/><rect x="13" y="14" width="9" height="7" rx="1.5"/>',
+    "stop": '<rect x="5" y="5" width="14" height="14" rx="2"/>',
 }
 _svg_cache: dict[tuple, QPixmap] = {}
 
@@ -1523,6 +1547,168 @@ class _PrivateServerManagerDialog(QDialog):
         super().done(result)
 
 
+_dwmapi = ctypes.WinDLL("dwmapi")
+
+
+class _ThumbProps(ctypes.Structure):
+    _fields_ = [
+        ("flags", wintypes.DWORD), ("dest", wintypes.RECT), ("source", wintypes.RECT),
+        ("opacity", ctypes.c_ubyte), ("visible", wintypes.BOOL), ("client_only", wintypes.BOOL),
+    ]
+
+
+_dwmapi.DwmRegisterThumbnail.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.POINTER(wintypes.HANDLE)]
+_dwmapi.DwmUnregisterThumbnail.argtypes = [wintypes.HANDLE]
+_dwmapi.DwmUpdateThumbnailProperties.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ThumbProps)]
+_DWM_TNP_DEST, _DWM_TNP_OPACITY, _DWM_TNP_VISIBLE, _DWM_TNP_CLIENT_ONLY = 0x1, 0x4, 0x8, 0x10
+
+
+class _DwmThumbnail:
+    """A live picture of a client window, composited by Windows straight into ours (what the
+    taskbar previews use): nothing is copied or read from the client. A minimized or hidden
+    client has no picture."""
+
+    def __init__(self):
+        self.handle = None
+        self.dest = 0
+        self.source = 0
+
+    def bind(self, dest: int, source: int) -> bool:
+        if self.handle is not None and (dest, source) == (self.dest, self.source):
+            return True
+        self.release()
+        handle = wintypes.HANDLE()
+        if _dwmapi.DwmRegisterThumbnail(dest, source, ctypes.byref(handle)) != 0:
+            return False
+        self.handle, self.dest, self.source = handle, dest, source
+        return True
+
+    def show(self, left: int, top: int, width: int, height: int) -> None:
+        if self.handle is None:
+            return
+        try:
+            _, _, source_w, source_h = win32gui.GetClientRect(self.source)
+        except Exception:
+            source_w = source_h = 0
+        if source_w <= 0 or source_h <= 0:
+            self.hide()
+            return
+        scale = min(width / source_w, height / source_h)
+        w, h = max(1, int(source_w * scale)), max(1, int(source_h * scale))
+        x, y = left + (width - w) // 2, top + (height - h) // 2
+        props = _ThumbProps(
+            _DWM_TNP_DEST | _DWM_TNP_OPACITY | _DWM_TNP_VISIBLE | _DWM_TNP_CLIENT_ONLY,
+            wintypes.RECT(x, y, x + w, y + h), wintypes.RECT(), 255, True, True,
+        )
+        _dwmapi.DwmUpdateThumbnailProperties(self.handle, ctypes.byref(props))
+
+    def hide(self) -> None:
+        if self.handle is not None:
+            props = _ThumbProps(_DWM_TNP_VISIBLE, wintypes.RECT(), wintypes.RECT(), 255, False, True)
+            _dwmapi.DwmUpdateThumbnailProperties(self.handle, ctypes.byref(props))
+
+    def release(self) -> None:
+        if self.handle is not None:
+            _dwmapi.DwmUnregisterThumbnail(self.handle)
+        self.handle = None
+        self.dest = self.source = 0
+
+
+def _short_duration(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes} min"
+    return f"{minutes // 60} h {minutes % 60:02d} min"
+
+
+class _ClientCard(QFrame):
+    """One running client on the Clients page: its live picture and what it is doing."""
+
+    menu_requested = Signal(object, QPoint)  # (client key, global position)
+    focus_requested = Signal(object)
+
+    PREVIEW_W, PREVIEW_H = 272, 153
+
+    def __init__(self, key: tuple[int, float], parent=None):
+        super().__init__(parent)
+        self.key = key
+        self.snapshot: dict = {}
+        self.thumbnail = _DwmThumbnail()
+        self.setObjectName("clientCard")
+        self.setFixedWidth(self.PREVIEW_W + 20)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(
+            lambda pos: self.menu_requested.emit(self.key, self.mapToGlobal(pos))
+        )
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(5)
+        self.preview = QLabel("No picture")
+        self.preview.setObjectName("clientPreview")
+        self.preview.setFixedSize(self.PREVIEW_W, self.PREVIEW_H)
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(self.preview)
+        top = QHBoxLayout()
+        top.setSpacing(6)
+        self.name_lbl = QLabel("")
+        self.name_lbl.setObjectName("accountName")
+        top.addWidget(self.name_lbl, 1)
+        self.state_lbl = QLabel("")
+        self.state_lbl.setObjectName("countChip")
+        top.addWidget(self.state_lbl)
+        self.menu_btn = QToolButton()
+        self.menu_btn.setText("⋯")
+        self.menu_btn.setAutoRaise(True)
+        self.menu_btn.setToolTip("Actions")
+        self.menu_btn.clicked.connect(
+            lambda: self.menu_requested.emit(
+                self.key, self.menu_btn.mapToGlobal(QPoint(0, self.menu_btn.height()))
+            )
+        )
+        top.addWidget(self.menu_btn)
+        lay.addLayout(top)
+        self.game_lbl = QLabel("")
+        self.game_lbl.setObjectName("fieldLabel")
+        lay.addWidget(self.game_lbl)
+        self.stats_lbl = QLabel("")
+        self.stats_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        lay.addWidget(self.stats_lbl)
+
+    def mouseDoubleClickEvent(self, event):
+        self.focus_requested.emit(self.key)
+        super().mouseDoubleClickEvent(event)
+
+    def update_from(self, snapshot: dict, game_name: str, limits: dict) -> None:
+        self.snapshot = snapshot
+        self.name_lbl.setText(snapshot.get("username") or f"PID {snapshot.get('pid')}")
+        state = "not responding" if snapshot.get("hung") else snapshot.get("state", "")
+        self.state_lbl.setText(state)
+        place = str(snapshot.get("place_id") or "")
+        self.game_lbl.setText(game_name or (f"Place {place}" if place else "Not in a game yet"))
+        parts = [
+            _short_duration(snapshot.get("uptime", 0)),
+            f"CPU {snapshot.get('cpu_percent', 0):.0f}%",
+            f"RAM {snapshot.get('rss_mb', 0) / 1024:.1f} GB",
+        ]
+        if limits.get("cpu_cap"):
+            parts.append(f"capped {limits['cpu_cap']}%")
+        if limits.get("efficiency"):
+            parts.append("eco")
+        self.stats_lbl.setText("  ·  ".join(parts))
+
+    def preview_rect(self) -> tuple[int, int, int, int] | None:
+        """Where the picture goes, in the top-level window's physical pixels."""
+        window = self.preview.window()
+        if window is None:
+            return None
+        origin = self.preview.mapTo(window, QPoint(0, 0))
+        ratio = window.devicePixelRatioF()
+        return (
+            int(origin.x() * ratio), int(origin.y() * ratio),
+            int(self.PREVIEW_W * ratio), int(self.PREVIEW_H * ratio),
+        )
+
+
 class _DetachablePageHost(QWidget):
     def __init__(self, page_index: int, page_name: str, parent=None):
         super().__init__(parent)
@@ -1702,6 +1888,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             5: "Console",
             6: "About",
             8: "Charts",
+            9: "Clients",
         }
         self._page_subtitles = {
             0: "Launch, organize and manage your Roblox accounts",
@@ -1713,6 +1900,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             6: f"{APP_NAME} by NightHub",
             7: "Secure your saved accounts before you start",
             8: "Trending Roblox games: search one and join it with any account",
+            9: "Every running client, live: what it is doing and what it uses",
         }
         self._window_grid_hotkey_registered = False
         self._window_grid_hotkey_hwnd = 0
@@ -1782,6 +1970,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         )
         self._bridge.charts_loaded.connect(self._on_charts_loaded)
         self._bridge.chart_icon_ready.connect(self._on_chart_icon_ready)
+        self._bridge.link_resolved.connect(self._on_link_resolved)
 
         # Charts tab
         self._charts_sorts: list[dict] = []
@@ -1868,6 +2057,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         self._refresh_account_list()
         self._refresh_recent_games()
         self._update_encryption_badge()
+        self._start_client_features()
         # Apply persisted settings that affect widgets built in _build_ui
         S = actions.load_ui_settings()
         discord_settings = S.get("discord_webhook", {})
@@ -1875,9 +2065,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             discord_settings.get("enabled", False)
             and discord_settings.get("screenshot_enabled", False)
         ):
-            webhook.start_screenshot_loop(
-                lambda: actions.get_ui_setting("discord_webhook", {})
-            )
+            webhook.start_screenshot_loop(actions.get_discord_config)
         self._place_id_edit.setCurrentText(S.get("last_place_id", ""))
         self._private_server_edit.setCurrentText(S.get("last_private_server", ""))
 
@@ -2035,6 +2223,13 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             }}
             QFrame#sideCard {{
                 background: {CARD}; border: 1px solid {LINE}; border-radius: 8px;
+            }}
+            QFrame#clientCard {{
+                background: {CARD}; border: 1px solid {LINE}; border-radius: 10px;
+            }}
+            QFrame#clientCard:hover {{ border-color: #26335C; }}
+            QLabel#clientPreview {{
+                background: {BG}; border-radius: 6px; color: #56608A; font-size: 11px;
             }}
 
             QLabel#brandName {{ color: {CREAM}; font-size: 16px; font-weight: 800; letter-spacing: 4px; }}
@@ -2275,6 +2470,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             5: self._build_console_panel,
             6: self._build_donations_panel,
             8: self._build_charts_panel,
+            9: self._build_clients_panel,
         }
 
         for index, page_name in self._page_names.items():
@@ -2363,6 +2559,8 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             self._charts_on_shown()
         if index in self._detached_windows:
             self._show_detached_page(index)
+        # Pictures are drawn over the window by Windows: hide them with the page.
+        QTimer.singleShot(0, self._refresh_client_thumbnails)
 
     def _ensure_page_built(self, index: int) -> None:
         if index not in self._built_pages:
@@ -2618,6 +2816,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         _NAV = [
             ("MANAGE", None, None),
             ("Accounts", "accounts", 0),
+            ("Clients", "clients", 9),
             ("Charts", "chart", 8),
             ("Auto-Rejoin", "rejoin", 1),
             ("Anti AFK", "afk", 2),
@@ -3269,8 +3468,27 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         self._afk_key_hint.setStyleSheet(f"color: {NOTE}; font-size: 10px;")
         self._afk_key_hint.hide()
         row_key.addWidget(self._afk_key_hint)
+        self._afk_f13_btn = QPushButton("Use F13")
+        self._afk_f13_btn.setObjectName("linkButton")
+        self._afk_f13_btn.setToolTip(
+            "No game uses F13, so the press keeps the client active\n"
+            "without moving your character (W walks it away from eggs, NPCs, etc.)."
+        )
+        self._afk_f13_btn.clicked.connect(self._on_afk_use_f13)
+        row_key.addWidget(self._afk_f13_btn)
         row_key.addStretch(1)
         form.addLayout(row_key)
+
+        self._afk_idle_chk = QCheckBox("Only while I'm away (no input for 5 s)")
+        self._afk_idle_chk.setChecked(True)
+        self._afk_idle_chk.setToolTip(
+            "Wait for a quiet moment before bringing Roblox windows to the front,\n"
+            "and stop the moment you touch the keyboard or mouse.\n"
+            "\"Trigger Anti-AFK Now\" still runs at once."
+        )
+        self._afk_idle_chk.setStyleSheet(f"QCheckBox {{ color: {MUTED}; font-size: 11px; }}")
+        self._afk_idle_chk.stateChanged.connect(self._on_afk_setting_changed)
+        form.addWidget(self._afk_idle_chk)
 
         # Press Count row
         row_press = QHBoxLayout()
@@ -3381,13 +3599,17 @@ class AccountManagerUIQt(QMainWindow): # Main Window
 
     def _load_afk_settings(self):
         saved = actions.load_ui_settings()
-        self._afk_key = saved.get("anti_afk_key", "w")
+        self._afk_key = saved.get("anti_afk_key", "f13")
         self._afk_press_count = saved.get("anti_afk_press_count", 1)
         self._afk_interval = saved.get("anti_afk_interval", 10)
         self._afk_tooltip_enabled = saved.get("anti_afk_tooltip_enabled", True)
         self._afk_tooltip_size = saved.get("anti_afk_tooltip_size", 100)
         self._afk_enabled = saved.get("anti_afk_enabled", False)
+        self._afk_only_when_idle = bool(saved.get("anti_afk_only_when_idle", True))
 
+        self._afk_idle_chk.blockSignals(True)
+        self._afk_idle_chk.setChecked(self._afk_only_when_idle)
+        self._afk_idle_chk.blockSignals(False)
         self._afk_key_btn.setText(self._afk_key.upper())
         self._afk_press_spin.setValue(int(self._afk_press_count))
         self._afk_interval_spin.setValue(int(self._afk_interval))
@@ -3403,6 +3625,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         self._afk_press_count = self._afk_press_spin.value()
         self._afk_interval = self._afk_interval_spin.value()
         self._afk_tooltip_enabled = self._afk_tooltip_chk.isChecked()
+        self._afk_only_when_idle = self._afk_idle_chk.isChecked()
         self._save_afk_settings()
         if (
             getattr(self, "_afk_enabled", False)
@@ -3413,7 +3636,14 @@ class AccountManagerUIQt(QMainWindow): # Main Window
                 self._afk_press_count,
                 self._afk_interval,
                 self._afk_tooltip_enabled,
+                self._afk_only_when_idle,
             )
+
+    def _on_afk_use_f13(self):
+        self._key_grab_active = False
+        self._afk_key_hint.hide()
+        self._afk_key_btn.setText("F13")
+        self._on_afk_setting_changed()
 
     def _on_afk_record_key(self):
         self._afk_key_btn.setText("...")
@@ -3462,6 +3692,9 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             self._afk_tooltip.show_message(message, x, y)
 
     def eventFilter(self, obj, event): # Handle key recording via event filter on the key button
+        if obj is getattr(self, "_clients_viewport", None) and event.type() == QEvent.Type.Resize:
+            QTimer.singleShot(0, self._relayout_client_cards)
+            return False
         if obj == self._afk_key_btn and self._key_grab_active:
             if event.type() == event.Type.KeyPress:
                 key_code = event.key()
@@ -3590,6 +3823,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
                 self._afk_press_count,
                 self._afk_interval,
                 self._afk_tooltip_enabled,
+                self._afk_only_when_idle,
             )
         else:
             actions.stop_anti_afk()
@@ -3608,6 +3842,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         actions.save_ui_setting("anti_afk_tooltip_enabled", self._afk_tooltip_enabled)
         actions.save_ui_setting("anti_afk_tooltip_size", self._afk_tooltip_size)
         actions.save_ui_setting("anti_afk_enabled", self._afk_enabled)
+        actions.save_ui_setting("anti_afk_only_when_idle", self._afk_only_when_idle)
 
     def _build_multi_roblox_panel(self) -> QFrame: # Multi Roblox
         panel = QFrame()
@@ -3959,20 +4194,25 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         _content_card_lay.setContentsMargins(4, 4, 4, 4)
         _content_card_lay.addWidget(content_stack)
 
-        CATEGORIES = ["General", "Roblox", "Discord", "Themes", "Misc", "Developer"]
+        # (name, page position in content_stack): pages are added in the order built below,
+        # the list shows them in this order.
+        CATEGORIES = [
+            ("General", 0), ("Roblox", 1), ("Performance", 6), ("Recovery", 7),
+            ("Automation", 8), ("Discord", 2), ("Themes", 3), ("Misc", 4), ("Developer", 5),
+        ]
         cat_buttons: list[QPushButton] = []
 
         def _switch_cat(idx: int):
             content_stack.setCurrentIndex(idx)
-            for i, b in enumerate(cat_buttons):
-                b.setChecked(i == idx)
+            for (_, page), b in zip(CATEGORIES, cat_buttons):
+                b.setChecked(page == idx)
 
-        for i, name in enumerate(CATEGORIES):
+        for name, page_index in CATEGORIES:
             btn = QPushButton(name)
             btn.setObjectName("navTab")
             btn.setCheckable(True)
-            btn.setChecked(i == 0)
-            btn.clicked.connect(lambda _=False, idx=i: _switch_cat(idx))
+            btn.setChecked(page_index == 0)
+            btn.clicked.connect(lambda _=False, idx=page_index: _switch_cat(idx))
             cat_lay.addWidget(btn)
             cat_buttons.append(btn)
 
@@ -4684,7 +4924,13 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         f.addLayout(url_row)
         self._sett_dc_url_edit = QLineEdit()
         self._sett_dc_url_edit.setPlaceholderText("https://discord.com/api/webhooks/...")
-        self._sett_dc_url_edit.setText(dc.get("url", ""))
+        self._sett_dc_url_edit.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)
+        self._sett_dc_url_edit.setToolTip(
+            "The URL holds the webhook's token, so it is kept encrypted with your accounts."
+        )
+        self._sett_dc_url_edit.setText(
+            str(self.manager.get_secure_setting("discord_webhook_url", "") or "")
+        )
         self._sett_dc_url_edit.editingFinished.connect(self._on_dc_save)
         f.addWidget(self._sett_dc_url_edit)
 
@@ -4756,6 +5002,43 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             cb.stateChanged.connect(self._on_dc_save)
             f.addWidget(cb)
             self._sett_dc_log_chks[key] = cb
+
+        f.addWidget(_sec("CLIENT ALERTS"))
+        f.addWidget(_chk(
+            "discord_alerts_enabled", "Post client alerts",
+            "Short messages when a client crashes, disconnects or restarts, and when a\n"
+            "batch finishes. Bundled every 2 seconds; only account names are sent.",
+        ))
+        for key, label, default in (
+            ("alert_crash", "Crashes and frozen clients", True),
+            ("alert_disconnect", "Disconnects", True),
+            ("alert_restart", "Auto-rejoin restarts", True),
+            ("alert_batch", "Finished batches", True),
+            ("alert_joined", "A client got into a game", False),
+        ):
+            f.addLayout(_sub_indent(_chk(key, label, "", default=default)))
+
+        f.addWidget(_sec("RICH PRESENCE"))
+        f.addWidget(_chk(
+            "discord_rpc_enabled", "Show NIGHT MANAGER on my Discord profile",
+            "Tells the Discord app on this PC the game and how many clients run.\n"
+            "Nothing goes over the network from here.",
+            on_change=lambda _value: self._apply_discord_presence(),
+        ))
+        rpc_row = QHBoxLayout()
+        rpc_row.setContentsMargins(18, 0, 0, 0)
+        rpc_lbl = QLabel("Application ID")
+        rpc_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        rpc_row.addWidget(rpc_lbl)
+        self._sett_rpc_id_edit = QLineEdit(str(S.get("discord_rpc_client_id", "") or ""))
+        self._sett_rpc_id_edit.setPlaceholderText("from discord.com/developers")
+        self._sett_rpc_id_edit.setToolTip(
+            "Rich presence needs a Discord application: create one at\n"
+            "discord.com/developers/applications (free) and paste its Application ID."
+        )
+        self._sett_rpc_id_edit.editingFinished.connect(self._on_rpc_id_changed)
+        rpc_row.addWidget(self._sett_rpc_id_edit, 1)
+        f.addLayout(rpc_row)
 
         f.addWidget(_sec("ACTIONS"))
         _test_btn = QPushButton("Test Webhook")
@@ -4875,6 +5158,20 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         f.addWidget(_enc_btn)
 
         f.addWidget(_sec("DATA"))
+        backup_row = QHBoxLayout()
+        _backup_export = QPushButton("Export Backup...")
+        _backup_export.setToolTip(
+            "Save every account (with its sign-in) to a password-protected file,\n"
+            "to move them to another PC or keep them safe."
+        )
+        _backup_export.clicked.connect(self._on_backup_export)
+        backup_row.addWidget(_backup_export)
+        _backup_import = QPushButton("Import Backup...")
+        _backup_import.setToolTip("Add the accounts from a NIGHT MANAGER backup file.")
+        _backup_import.clicked.connect(self._on_backup_import)
+        backup_row.addWidget(_backup_import)
+        backup_row.addStretch(1)
+        f.addLayout(backup_row)
         _wipe_btn = QPushButton("Wipe All Data")
         _wipe_btn.setToolTip(
             "Permanently delete all saved accounts, settings, and cached data.\n"
@@ -4978,6 +5275,253 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         )
         f.addWidget(ws_docs_btn)
 
+        f.addStretch(1)
+
+        def _spin(key: str, low: int, high: int, default: int, suffix: str = "", special: str = "",
+                  on_change=None) -> QSpinBox:
+            spin = QSpinBox()
+            spin.setRange(low, high)
+            spin.setValue(int(S.get(key, default) or 0))
+            spin.setSuffix(suffix)
+            if special:
+                spin.setSpecialValueText(special)
+            spin.setFixedWidth(110)
+            spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+
+            def _save(value):
+                actions.save_ui_setting(key, int(value))
+                if on_change:
+                    on_change(int(value))
+
+            spin.valueChanged.connect(_save)
+            return spin
+
+        def _row(label: str, widget: QWidget, tip: str = "", indent: int = 0) -> QHBoxLayout:
+            row = QHBoxLayout()
+            row.setContentsMargins(indent, 0, 0, 0)
+            text = QLabel(label)
+            text.setToolTip(tip)
+            widget.setToolTip(tip)
+            row.addWidget(text)
+            row.addStretch(1)
+            row.addWidget(widget)
+            return row
+
+        def _note(text: str) -> QLabel:
+            label = QLabel(text)
+            label.setWordWrap(True)
+            label.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
+            return label
+
+        # Performance (Page 6)
+        sa, f = _scrollable()
+        content_stack.addWidget(sa)
+
+        f.addWidget(_sec("CLIENTS YOU LAUNCH"))
+        f.addWidget(_note(
+            "Set just for the clients NIGHT MANAGER starts: your own Roblox settings are put "
+            "back as soon as each client has read them."
+        ))
+        f.addLayout(_row(
+            "FPS cap", _spin("launch_fps_cap", 0, 360, 0, " FPS", "Roblox's own"),
+            "Roblox's Maximum Frame Rate for launched clients (5-360). Lower = less CPU and GPU per client.",
+        ))
+        f.addWidget(_chk(
+            "launch_lowest_graphics", "Lowest graphics quality",
+            "Launched clients start at Graphics Quality 1: far less GPU per client.",
+        ))
+        main_row = QHBoxLayout()
+        main_lbl = QLabel("Main accounts")
+        main_lbl.setToolTip("Accounts you play yourself: they keep your graphics and are never limited.")
+        main_row.addWidget(main_lbl)
+        main_row.addStretch(1)
+        self._main_accounts_lbl = QLabel(self._main_accounts_text())
+        self._main_accounts_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        main_row.addWidget(self._main_accounts_lbl)
+        main_btn = QPushButton("Choose...")
+        main_btn.clicked.connect(self._choose_main_accounts)
+        main_row.addWidget(main_btn)
+        f.addLayout(main_row)
+
+        f.addWidget(_sec("BACKGROUND CLIENTS"))
+        f.addWidget(_note(
+            "Limits for the clients you aren't playing, set through Windows (nothing goes into "
+            "Roblox). The client in front, one still loading or not responding, and main accounts "
+            "are left alone. Per-client limits on the Clients page win over these."
+        ))
+        f.addWidget(_chk("limits_background_enabled", "Limit background clients", ""))
+        f.addLayout(_sub_indent(_chk(
+            "limits_background_cpu", "Cap their CPU", "A hard CPU cap per background client (its frame rate drops with it).",
+            default=True,
+        )))
+        f.addLayout(_row(
+            "CPU per client", _spin("limits_background_cpu_percent", 0, 100, 0, " %", "Fair share"),
+            "Percent of the whole CPU each background client may use. Fair share splits 80% among them (2-25% each).",
+            indent=36,
+        ))
+        f.addLayout(_sub_indent(_chk(
+            "limits_background_efficiency", "Efficiency mode",
+            "Windows' EcoQoS, below-normal priority and low memory priority.", default=True,
+        )))
+        f.addLayout(_row(
+            "Trim memory every", _spin("limits_background_trim_minutes", 0, 240, 0, " min", "Never"),
+            "Pages a background client's memory out now and then. Its RAM use drops; it pages back in as used.",
+            indent=18,
+        ))
+
+        f.addWidget(_sec("WINDOWS"))
+        f.addWidget(_chk(
+            "free_resize_enabled", "Free resizing",
+            "Drag a Roblox window's edges below the ~800x600 minimum Roblox holds it to, and move a\n"
+            "small window by its title bar without it snapping back. Uses a mouse hook in this app only.",
+            on_change=self._on_free_resize_toggled,
+        ))
+
+        f.addWidget(_sec("BANDWIDTH"))
+        f.addWidget(_note(
+            "One upload cap for all Roblox clients together (a Windows QoS policy). Needs an admin "
+            "prompt; Windows drops it on restart."
+        ))
+        bw_row = QHBoxLayout()
+        self._bandwidth_spin = QSpinBox()
+        self._bandwidth_spin.setRange(bandwidth_mod.MIN_KBPS, bandwidth_mod.MAX_KBPS)
+        self._bandwidth_spin.setValue(bandwidth_mod.active_kbps() or 2000)
+        self._bandwidth_spin.setSuffix(" kbit/s")
+        self._bandwidth_spin.setFixedWidth(130)
+        self._bandwidth_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        bw_row.addWidget(self._bandwidth_spin)
+        bw_apply = QPushButton("Apply")
+        bw_apply.clicked.connect(self._on_bandwidth_apply)
+        bw_row.addWidget(bw_apply)
+        bw_clear = QPushButton("Remove")
+        bw_clear.clicked.connect(self._on_bandwidth_clear)
+        bw_row.addWidget(bw_clear)
+        bw_row.addStretch(1)
+        f.addLayout(bw_row)
+
+        f.addWidget(_sec("ROBLOX UPDATES"))
+        self._roblox_update_lbl = QLabel("Checking Roblox's version...")
+        self._roblox_update_lbl.setWordWrap(True)
+        f.addWidget(self._roblox_update_lbl)
+        ru_row = QHBoxLayout()
+        ru_check = QPushButton("Check Now")
+        ru_check.clicked.connect(self._start_roblox_update_check)
+        ru_row.addWidget(ru_check)
+        self._roblox_update_btn = QPushButton("Update Roblox")
+        self._roblox_update_btn.setToolTip(
+            "Downloads Roblox's own installer and runs it only if Windows confirms it is signed by\n"
+            "Roblox Corporation. Every client must be closed first."
+        )
+        self._roblox_update_btn.setEnabled(False)
+        self._roblox_update_btn.clicked.connect(self._on_roblox_update_install)
+        ru_row.addWidget(self._roblox_update_btn)
+        ru_row.addStretch(1)
+        f.addLayout(ru_row)
+        if getattr(self, "_roblox_update_state", None):
+            self._on_roblox_update_status(self._roblox_update_state)
+        else:
+            self._start_roblox_update_check()
+
+        f.addWidget(_sec("PROFILES"))
+        f.addWidget(_note(
+            "Share these performance settings as a code or file. Only performance settings travel: "
+            "never accounts, cookies, webhooks or hotkeys."
+        ))
+        profile_row = QHBoxLayout()
+        for label, slot in (
+            ("Copy Code", self._on_profile_copy),
+            ("Paste Code...", self._on_profile_import),
+            ("Export File...", self._on_profile_export_file),
+            ("Import File...", self._on_profile_import_file),
+        ):
+            button = QPushButton(label)
+            button.clicked.connect(slot)
+            profile_row.addWidget(button)
+        profile_row.addStretch(1)
+        f.addLayout(profile_row)
+        f.addStretch(1)
+
+        # Recovery (Page 7)
+        sa, f = _scrollable()
+        content_stack.addWidget(sa)
+        f.addWidget(_note(
+            "For accounts on Auto-Rejoin. A client is read from its own log: a disconnect is seen "
+            "within seconds (after 30 s with no new join, so teleports don't count), a crash at once."
+        ))
+        f.addWidget(_sec("RESTART"))
+        f.addWidget(_chk(
+            "recovery_restart_on_hang", "Restart clients that stop responding",
+            "A client whose window hasn't responded for a minute is closed and launched again.",
+        ))
+        f.addLayout(_row(
+            "Restart over", _spin("recovery_memory_limit_mb", 0, 65536, 0, " MB", "Never"),
+            "A client whose committed memory stays over this is closed and launched again.",
+        ))
+        f.addWidget(_chk(
+            "recovery_rejoin_after_leave", "Rejoin even after I leave a game myself",
+            "Off: leaving with the in-game Leave button stops Auto-Rejoin for that account.",
+        ))
+        f.addWidget(_sec("CRASH BREAKER"))
+        f.addWidget(_note(
+            "Stops relaunching an account that keeps failing, with a longer wait after each relaunch."
+        ))
+        f.addLayout(_row(
+            "Give up after", _spin("recovery_breaker_max", 0, 50, 3, " relaunches", "Never"),
+            "Relaunches of one account within the window below before Auto-Rejoin stops it.",
+        ))
+        f.addLayout(_row(
+            "Within", _spin("recovery_breaker_window_min", 1, 240, 10, " min"),
+            "The time window the relaunches are counted in.",
+        ))
+        history_btn = QPushButton("Crash History")
+        history_btn.clicked.connect(self._show_crash_history)
+        f.addWidget(history_btn)
+        f.addStretch(1)
+
+        # Automation (Page 8)
+        sa, f = _scrollable()
+        content_stack.addWidget(sa)
+        f.addWidget(_sec("STOP ALL HOTKEY"))
+        f.addWidget(_chk(
+            "panic_hotkey_enabled", "Global Stop All hotkey",
+            "One key, anywhere, ends every Roblox client and stops Auto-Rejoin.",
+            on_change=lambda _value: self._apply_panic_hotkey(),
+        ))
+        panic_btn = _HotkeyCaptureButton(str(S.get("panic_hotkey", "Ctrl+Alt+End") or "Ctrl+Alt+End"))
+        panic_btn.setFixedWidth(150)
+        panic_btn.sequence_changed.connect(
+            lambda sequence: (actions.save_ui_setting("panic_hotkey", sequence), self._apply_panic_hotkey())
+        )
+        f.addLayout(_row("Hotkey", panic_btn, "Click, press a shortcut, release its main key.", indent=18))
+
+        f.addWidget(_sec("AUTO-SHUTDOWN"))
+        f.addWidget(_note(
+            "At this time, close every client and shut the PC down (60 s warning; "
+            "'shutdown /a' cancels it). Survives a restart of NIGHT MANAGER."
+        ))
+        shutdown_row = QHBoxLayout()
+        self._auto_shutdown_time = QTimeEdit(QTime(3, 0))
+        self._auto_shutdown_time.setDisplayFormat("HH:mm")
+        self._auto_shutdown_time.setFixedWidth(104)
+        shutdown_row.addWidget(self._auto_shutdown_time)
+        shutdown_set = QPushButton("Set")
+        shutdown_set.clicked.connect(self._on_auto_shutdown_set)
+        shutdown_row.addWidget(shutdown_set)
+        shutdown_cancel = QPushButton("Cancel")
+        shutdown_cancel.clicked.connect(self._on_auto_shutdown_cancel)
+        shutdown_row.addWidget(shutdown_cancel)
+        self._auto_shutdown_status = QLabel("")
+        self._auto_shutdown_status.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        shutdown_row.addWidget(self._auto_shutdown_status)
+        shutdown_row.addStretch(1)
+        f.addLayout(shutdown_row)
+        self._update_auto_shutdown_status()
+
+        f.addWidget(_sec("ROBLOX LOGS"))
+        f.addWidget(_chk(
+            "clean_roblox_logs", "Clean old Roblox logs every hour",
+            "Deletes Roblox logs over a day old or over 50 MB, never a running client's.",
+        ))
         f.addStretch(1)
 
         return panel
@@ -6678,7 +7222,15 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         try:
             dc = actions.load_ui_settings().get("discord_webhook", {})
             dc["enabled"] = self._sett_dc_enabled_chk.isChecked()
-            dc["url"] = self._sett_dc_url_edit.text().strip()
+            url = self._sett_dc_url_edit.text().strip()
+            if url != str(self.manager.get_secure_setting("discord_webhook_url", "") or ""):
+                if url:
+                    saved = self.manager.set_secure_setting("discord_webhook_url", url)
+                else:
+                    saved = self.manager.remove_secure_setting("discord_webhook_url")
+                if not saved:
+                    self._show_operation_error(saved)
+            dc.pop("url", None)
             dc["enable_ping"] = self._sett_dc_ping_chk.isChecked()
             dc["ping_user_id"] = self._sett_dc_pingid_edit.text().strip()
             dc["ping_on_error"] = self._sett_dc_pingerr_chk.isChecked()
@@ -6688,13 +7240,38 @@ class AccountManagerUIQt(QMainWindow): # Main Window
                 dc[key] = cb.isChecked()
             actions.save_ui_setting("discord_webhook", dc)
             if dc.get("enabled") and dc.get("screenshot_enabled"):
-                webhook.start_screenshot_loop(
-                    lambda: actions.get_ui_setting("discord_webhook", {})
-                )
+                webhook.start_screenshot_loop(actions.get_discord_config)
             else:
                 webhook.stop_screenshot_loop()
         except Exception as e:
             print(f"[Discord] Failed to save settings: {e}")
+
+    def _on_rpc_id_changed(self):
+        actions.save_ui_setting(
+            "discord_rpc_client_id", "".join(ch for ch in self._sett_rpc_id_edit.text() if ch.isdigit())
+        )
+        self._apply_discord_presence()
+
+    def _apply_discord_presence(self):
+        settings = actions.load_ui_settings()
+        client_id = str(settings.get("discord_rpc_client_id", "") or "")
+        if settings.get("discord_rpc_enabled", False) and client_id:
+            discord_rpc_mod.PRESENCE.start(client_id)
+            self._update_discord_presence(client_tracker_mod.get_tracker(self.manager).snapshots())
+        else:
+            discord_rpc_mod.PRESENCE.stop()
+
+    def _update_discord_presence(self, clients: list[dict]):
+        in_game = [c for c in clients if c.get("state") == "in game"]
+        names = {self._game_names.get(str(c.get("place_id") or ""), "") for c in in_game} - {""}
+        if len(names) == 1:
+            details = f"Playing {names.pop()}"
+        elif in_game:
+            details = "Playing Roblox"
+        else:
+            details = "Idling"
+        count = len(clients)
+        discord_rpc_mod.PRESENCE.update(details, f"{count} client{'s' if count != 1 else ''} running")
 
     def _on_dc_test(self):
         url = self._sett_dc_url_edit.text().strip()
@@ -6953,6 +7530,10 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         self._ar_refresh_list()
 
     def nativeEvent(self, event_type, message):
+        if window_grid_mod.is_hotkey_message(message, window_grid_mod.PANIC_HOTKEY_ID):
+            print("[WARNING] Stop All hotkey pressed")
+            self._stop_everything(confirm=False)
+            return True, 0
         if window_grid_mod.is_hotkey_message(message):
             settings = actions.load_ui_settings()
             result = window_grid_mod.tile_roblox_windows(
@@ -7120,6 +7701,8 @@ class AccountManagerUIQt(QMainWindow): # Main Window
 
         try:
             self._unregister_window_grid_hotkey()
+            if self._panic_hotkey_hwnd:
+                window_grid_mod.unregister_hotkey(self._panic_hotkey_hwnd, window_grid_mod.PANIC_HOTKEY_ID)
         except Exception:
             pass
         try:
@@ -7127,6 +7710,18 @@ class AccountManagerUIQt(QMainWindow): # Main Window
                 worker.stop(join_timeout=1.0)
         except Exception:
             pass
+        # Clients keep running after we exit: give them back everything we limited.
+        for step in (
+            self._hide_client_thumbnails,
+            client_tracker_mod.shutdown,
+            client_limits_mod.release_all,
+            lambda: free_resize_mod.get().stop(),
+            discord_rpc_mod.PRESENCE.stop,
+        ):
+            try:
+                step()
+            except Exception as exc:
+                print(f"[WARNING] Shutdown step failed: {type(exc).__name__}: {exc}")
         try:
             if self._cv_validator is not None:
                 stopped = self._cv_validator.stop(join_timeout=2.0)
@@ -7263,14 +7858,18 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         lay.addSpacing(2)
 
         # Place ID
-        place_lbl = QLabel("Place ID")
+        place_lbl = QLabel("Place ID or link")
         place_lbl.setObjectName("fieldLabel")
         lay.addWidget(place_lbl)
 
         self._place_id_edit = QComboBox()
         self._place_id_edit.setEditable(True)
         self._place_id_edit.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self._place_id_edit.lineEdit().setPlaceholderText("e.g. 10449761463") # This game is fun
+        self._place_id_edit.lineEdit().setPlaceholderText("ID, game / share link or @user")
+        self._place_id_edit.setToolTip(
+            "A place ID, or paste any Roblox link: game pages, server links,\n"
+            "private server and share links, roblox:// links, profiles or @username."
+        )
         self._place_id_edit.currentTextChanged.connect(self._on_place_id_changed)
         self._place_id_edit.activated.connect(self._on_favorite_selected)
         self._favorite_ctx_filter = _ComboRightClickFilter(self)
@@ -7305,10 +7904,17 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         act_job_id = self._join_menu.addAction("Job ID")
         act_small_srv = self._join_menu.addAction("Small Server")
         self._join_menu.addSeparator()
+        act_same_pick = self._join_menu.addAction("Same Server: Pick One With Room")
+        act_same_pick.setToolTip("Find one public server with room for every selected account")
+        act_same_follow = self._join_menu.addAction("Same Server: Follow the First")
+        act_same_follow.setToolTip("Launch the first account, then send the rest to its server")
+        self._join_menu.addSeparator()
         act_save_fav = self._join_menu.addAction("Save Current Game")
         act_join_user.triggered.connect(self._on_join_user)
         act_job_id.triggered.connect(self._on_join_job_id)
         act_small_srv.triggered.connect(self._on_join_small_server)
+        act_same_pick.triggered.connect(lambda: self._on_join_same_server("pick"))
+        act_same_follow.triggered.connect(lambda: self._on_join_same_server("follow"))
         act_save_fav.triggered.connect(self._on_save_current_game)
 
         self._join_arrow = QToolButton()
@@ -7923,7 +8529,14 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         actions.save_ui_setting("last_private_server", private)
         if place_id:
             if not place_id.isdigit():
-                self._game_name_label.setText("")
+                parsed = launch_target_mod.parse(place_id)
+                linked_place = parsed.get("place_id")
+                if linked_place:
+                    self._fetch_game_name_for(str(linked_place))
+                elif parsed["kind"] in ("Invalid", "Unsupported"):
+                    self._game_name_label.setText(parsed["reason"])
+                else:
+                    self._game_name_label.setText(launch_target_mod.describe(parsed))
                 return
             self._fetch_game_name_for(place_id)
             return
@@ -8188,6 +8801,11 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         if not self._confirm_launch("Join Place ID", usernames):
             return
 
+        if place_id and not place_id.isdigit():
+            # A pasted link, share link, @user...: work out what it is, then join it.
+            self._join_pasted_target(usernames, place_id, private)
+            return
+
         if place_id:
             # Place ID inputbox takes priority over any place id embedded in the link
             self._dispatch_join_place(usernames, place_id, private, place_id)
@@ -8204,6 +8822,61 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             })
 
         threading.Thread(target=_resolve_worker, daemon=True, name="resolve-join-place").start()
+
+    def _join_pasted_target(self, usernames: list[str], text: str, private: str) -> None:
+        parsed = launch_target_mod.parse(text)
+        if parsed["kind"] in ("Invalid", "Unsupported"):
+            _show_error(self, "Can't Join That", parsed["reason"])
+            return
+        if parsed["kind"] == "Place" and not parsed.get("launch_data"):
+            place_id = str(parsed["place_id"])
+            self._dispatch_join_place(usernames, place_id, private, place_id)
+            return
+        cookie = self.manager.accounts.get(usernames[0], {}).get("cookie", "")
+
+        def _resolve_worker():
+            try:
+                action, warning = launch_target_mod.resolve(parsed, cookie)
+                payload = {"usernames": usernames, "action": action, "warning": warning}
+            except launch_target_mod.ResolveError as exc:
+                payload = {"usernames": usernames, "error": str(exc)}
+            except Exception as exc:
+                payload = {"usernames": usernames, "error": f"{type(exc).__name__}: {exc}"}
+            self._bridge.link_resolved.emit(payload)
+
+        threading.Thread(target=_resolve_worker, daemon=True, name="resolve-pasted-link").start()
+
+    def _on_link_resolved(self, payload: dict) -> None:
+        if payload.get("error"):
+            _show_error(self, "Can't Join That", payload["error"])
+            return
+        if payload.get("warning"):
+            print(f"[WARNING] {payload['warning']}")
+        usernames = payload["usernames"]
+        action = payload["action"]
+        kind = action["action"]
+        if kind == "place":
+            place_id = str(action["place_id"])
+            self._dispatch_join_place(usernames, place_id, "", place_id)
+        elif kind == "private":
+            place_id = str(action["place_id"])
+            self._dispatch_join_place(usernames, place_id, str(action["private"]), place_id)
+        elif kind == "job":
+            actions.join_job_id(
+                self.manager, usernames, str(action["place_id"]), action["job_id"],
+                on_done=self._emit_launch_done,
+            )
+        elif kind in ("follow", "username"):
+            target = action.get("name") or ""
+
+            def _follow_worker():
+                name = target or RobloxAPI.get_username_from_user_id(action["user_id"]) or ""
+                if not name:
+                    self._bridge.link_resolved.emit({"error": "That player couldn't be found."})
+                    return
+                actions.join_user(self.manager, usernames, name, on_done=self._emit_launch_done)
+
+            threading.Thread(target=_follow_worker, daemon=True, name="join-pasted-user").start()
 
     def _on_join_place_resolved(self, payload: dict):
         effective_place_id = payload.get("effective_place_id", "")
@@ -8240,6 +8913,677 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             self._bridge.recent_game_saved.emit()
 
         threading.Thread(target=_save_recent_worker, daemon=True, name="save-recent-game").start()
+
+    # Clients: the client tracker and everything that runs off it
+    def _start_client_features(self) -> None:
+        self._game_names: dict[str, str] = {}
+        self._game_name_pending: set[str] = set()
+        self._latest_clients: list[dict] = []
+        self._client_cards: dict[tuple, _ClientCard] = {}
+        self._micro_placements: dict[int, object] = {}
+        self._panic_hotkey_hwnd = 0
+
+        # The webhook URL moves out of the plain settings file into the encrypted account data.
+        legacy = dict(actions.get_ui_setting("discord_webhook", {}) or {})
+        legacy_url = str(legacy.get("url", "") or "").strip()
+        if legacy_url:
+            stored = str(self.manager.get_secure_setting("discord_webhook_url", "") or "")
+            if stored or self.manager.set_secure_setting("discord_webhook_url", legacy_url):
+                legacy.pop("url", None)
+                actions.save_ui_setting("discord_webhook", legacy)
+                print("[INFO] Discord webhook URL moved into the encrypted account data")
+        actions.set_discord_url_provider(
+            lambda: str(self.manager.get_secure_setting("discord_webhook_url", "") or "")
+        )
+
+        self._bridge.clients_update.connect(self._on_clients_update)
+        self._bridge.client_event.connect(self._on_client_event)
+        self._bridge.roblox_update_status.connect(self._on_roblox_update_status)
+        tracker = client_tracker_mod.get_tracker(self.manager)
+
+        def _listen(event, data):
+            if event == "clients":
+                self._bridge.clients_update.emit(data)
+            else:
+                self._bridge.client_event.emit(event, data)
+
+        tracker.add_listener(_listen)
+        tracker.add_tick_hook(client_limits_mod.plan_tick)
+        tracker.add_tick_hook(lambda clients: free_resize_mod.get().set_pids({c.pid for c in clients}))
+        if actions.get_ui_setting("free_resize_enabled", False):
+            free_resize_mod.get().start()
+        self._apply_discord_presence()
+
+        # Housekeeping that runs while the app is open.
+        self._housekeeping_timer = QTimer(self)
+        self._housekeeping_timer.setInterval(30_000)
+        self._housekeeping_timer.timeout.connect(self._on_housekeeping_tick)
+        self._housekeeping_timer.start()
+        self._last_log_clean = 0.0
+        self._last_roblox_check = 0.0
+        QTimer.singleShot(4000, self._on_housekeeping_tick)
+        QTimer.singleShot(0, self._apply_panic_hotkey)
+
+    def _on_housekeeping_tick(self) -> None:
+        now = time.time()
+        settings = actions.load_ui_settings()
+        if settings.get("clean_roblox_logs", False) and now - self._last_log_clean >= 3600:
+            self._last_log_clean = now
+            live = {c.get("log_path") for c in self._latest_clients if c.get("log_path")}
+
+            def _clean():
+                files, freed = roblox_logs_mod.clean_old_logs(live)
+                if files:
+                    print(f"[INFO] Cleaned {files} old Roblox log(s), {freed / 1048576:.0f} MB")
+
+            threading.Thread(target=_clean, daemon=True, name="RobloxLogCleaner").start()
+        if now - self._last_roblox_check >= 3600:
+            self._last_roblox_check = now
+            self._start_roblox_update_check()
+        shutdown_at = float(settings.get("auto_shutdown_at", 0) or 0)
+        if shutdown_at and now >= shutdown_at:
+            actions.save_ui_setting("auto_shutdown_at", 0)
+            self._run_auto_shutdown()
+        if hasattr(self, "_auto_shutdown_status"):
+            self._update_auto_shutdown_status()
+
+    def _on_clients_update(self, clients: list) -> None:
+        self._latest_clients = list(clients)
+        for client in clients:
+            place = str(client.get("place_id") or "")
+            if place and place not in self._game_names and place not in self._game_name_pending:
+                self._game_name_pending.add(place)
+
+                def _named(name, place=place):
+                    self._game_names[place] = name or ""
+                    self._game_name_pending.discard(place)
+
+                actions.fetch_game_name_async(place, _named)
+        if actions.get_ui_setting("discord_rpc_enabled", False):
+            self._update_discord_presence(clients)
+        if not hasattr(self, "_clients_grid"):
+            return
+        live = {(c["pid"], c["create_time"]): c for c in clients}
+        changed = False
+        for key in [k for k in self._client_cards if k not in live]:
+            card = self._client_cards.pop(key)
+            card.thumbnail.release()
+            card.deleteLater()
+            changed = True
+        for key, snapshot in live.items():
+            card = self._client_cards.get(key)
+            if card is None:
+                card = _ClientCard(key)
+                card.menu_requested.connect(self._on_client_menu)
+                card.focus_requested.connect(self._focus_client)
+                self._client_cards[key] = card
+                changed = True
+            card.update_from(
+                snapshot,
+                self._game_names.get(str(snapshot.get("place_id") or ""), ""),
+                client_limits_mod.applied_of(key),
+            )
+        count = len(clients)
+        self._clients_count_lbl.setText(
+            f"{count} client{'s' if count != 1 else ''} running" if count else "No clients running"
+        )
+        self._clients_empty_lbl.setVisible(not count)
+        if changed:
+            self._relayout_client_cards()
+        else:
+            self._refresh_client_thumbnails()
+
+    def _on_client_event(self, event: str, snapshot: dict) -> None:
+        name = snapshot.get("username") or f"PID {snapshot.get('pid')}"
+        if event == "ended":
+            kind = snapshot.get("kind", "")
+            if kind in ("crashed", "hung", "disconnected"):
+                reason = snapshot.get("reason") or ""
+                discord_alerts_mod.notify(kind, name, reason)
+            threading.Thread(target=launch_settings_mod.settle, daemon=True, name="launch-settings-settle").start()
+        elif event == "joined":
+            place = str(snapshot.get("place_id") or "")
+            discord_alerts_mod.notify("joined", name, self._game_names.get(place) or f"Place {place}")
+
+    def _build_clients_panel(self) -> QWidget:
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(10, 4, 10, 10)
+        outer.setSpacing(10)
+
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+        self._clients_count_lbl = QLabel("No clients running")
+        self._clients_count_lbl.setObjectName("sectionTitle")
+        bar.addWidget(self._clients_count_lbl)
+        bar.addStretch(1)
+        self._clients_preview_chk = QCheckBox("Live previews")
+        self._clients_preview_chk.setChecked(bool(actions.get_ui_setting("clients_previews", True)))
+        self._clients_preview_chk.setToolTip(
+            "Windows draws each client's picture here, as in taskbar previews.\n"
+            "Minimized or hidden clients have none."
+        )
+        self._clients_preview_chk.toggled.connect(
+            lambda on: (actions.save_ui_setting("clients_previews", on), self._refresh_client_thumbnails())
+        )
+        bar.addWidget(self._clients_preview_chk)
+        for label, tip, slot in (
+            ("Tile", "Arrange every client in a grid on the screen under the mouse", self._on_clients_tile),
+            ("Minimize All", "Minimize every client", lambda: self._show_all_clients(win32con.SW_MINIMIZE)),
+            ("Restore All", "Bring every minimized client back", lambda: self._show_all_clients(win32con.SW_RESTORE)),
+            ("Crash History", "Clients that crashed, froze or were disconnected", self._show_crash_history),
+        ):
+            button = QPushButton(label)
+            button.setObjectName("ghost")
+            button.setToolTip(tip)
+            button.clicked.connect(slot)
+            bar.addWidget(button)
+        stop_btn = QPushButton("  Stop All")
+        stop_btn.setObjectName("danger")
+        stop_btn.setIcon(_svg_icon("stop", DANGER, size=14))
+        stop_btn.setToolTip("End every Roblox client and stop auto-rejoin (also the panic hotkey)")
+        stop_btn.clicked.connect(lambda: self._stop_everything(confirm=True))
+        bar.addWidget(stop_btn)
+        outer.addLayout(bar)
+
+        self._clients_scroll = QScrollArea()
+        self._clients_scroll.setWidgetResizable(True)
+        self._clients_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        host = QWidget()
+        host.setStyleSheet("background: transparent;")
+        host_lay = QVBoxLayout(host)
+        host_lay.setContentsMargins(0, 0, 0, 0)
+        self._clients_empty_lbl = QLabel(
+            "Running Roblox clients show up here with a live picture, their game, "
+            "uptime and what they use.\nRight-click a client (or its ⋯) to focus it, "
+            "shrink it, limit it or close it; double-click to bring it to the front."
+        )
+        self._clients_empty_lbl.setStyleSheet(f"color: {MUTED}; font-size: 12px; padding: 20px;")
+        self._clients_empty_lbl.setWordWrap(True)
+        host_lay.addWidget(self._clients_empty_lbl)
+        grid_host = QWidget()
+        self._clients_grid = QGridLayout(grid_host)
+        self._clients_grid.setContentsMargins(0, 0, 0, 0)
+        self._clients_grid.setSpacing(12)
+        self._clients_grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        host_lay.addWidget(grid_host)
+        host_lay.addStretch(1)
+        self._clients_scroll.setWidget(host)
+        self._clients_viewport = self._clients_scroll.viewport()
+        self._clients_viewport.installEventFilter(self)
+        self._clients_scroll.verticalScrollBar().valueChanged.connect(
+            lambda _value: self._refresh_client_thumbnails()
+        )
+        outer.addWidget(self._clients_scroll, 1)
+        QTimer.singleShot(0, lambda: self._on_clients_update(self._latest_clients))
+        return page
+
+    def _relayout_client_cards(self) -> None:
+        if not hasattr(self, "_clients_grid"):
+            return
+        width = self._clients_viewport.width()
+        card_width = _ClientCard.PREVIEW_W + 20 + self._clients_grid.spacing()
+        columns = max(1, (width + self._clients_grid.spacing()) // card_width)
+        cards = sorted(self._client_cards.values(), key=lambda card: card.key[1])
+        for card in cards:
+            self._clients_grid.removeWidget(card)
+        for index, card in enumerate(cards):
+            self._clients_grid.addWidget(card, index // columns, index % columns)
+        QTimer.singleShot(0, self._refresh_client_thumbnails)
+
+    def _refresh_client_thumbnails(self) -> None:
+        cards = getattr(self, "_client_cards", {})
+        if not cards:
+            return
+        previews_on = bool(actions.get_ui_setting("clients_previews", True))
+        viewport = getattr(self, "_clients_viewport", None)
+        for card in cards.values():
+            hwnd = int(card.snapshot.get("hwnd") or 0)
+            window = card.window()
+            reason = ""
+            if not previews_on:
+                reason = "Previews off"
+            elif not hwnd or not win32gui.IsWindow(hwnd):
+                reason = "No window yet"
+            elif win32gui.IsIconic(hwnd):
+                reason = "Minimized"
+            elif not win32gui.IsWindowVisible(hwnd):
+                reason = "Hidden"
+            visible = card.isVisible() and window is not None and not window.isMinimized()
+            if visible and viewport is not None:
+                top_left = card.preview.mapTo(viewport, QPoint(0, 0))
+                inside = QRect(top_left, card.preview.size())
+                visible = viewport.rect().contains(inside)
+            if reason or not visible:
+                card.thumbnail.hide()
+                card.preview.setText(reason or "")
+                continue
+            rect = card.preview_rect()
+            if rect and card.thumbnail.bind(int(window.winId()), hwnd):
+                card.preview.setText("")
+                card.thumbnail.show(*rect)
+            else:
+                card.preview.setText("No picture")
+
+    def _hide_client_thumbnails(self) -> None:
+        for card in getattr(self, "_client_cards", {}).values():
+            card.thumbnail.release()
+
+    def _client_snapshot(self, key) -> dict:
+        card = self._client_cards.get(key)
+        if card is not None:
+            return card.snapshot
+        return next(
+            (c for c in self._latest_clients if (c["pid"], c["create_time"]) == tuple(key)), {}
+        )
+
+    def _focus_client(self, key) -> None:
+        hwnd = int(self._client_snapshot(key).get("hwnd") or 0)
+        if not hwnd:
+            return
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        threading.Thread(target=actions._focus_afk_window, args=(hwnd,), daemon=True).start()
+
+    def _on_client_menu(self, key, global_pos) -> None:
+        snapshot = self._client_snapshot(key)
+        if not snapshot:
+            return
+        hwnd = int(snapshot.get("hwnd") or 0)
+        username = snapshot.get("username") or ""
+        manual = client_limits_mod.manual_of(key)
+        applied = client_limits_mod.applied_of(key)
+        menu = QMenu(self)
+        menu.addAction("Bring to Front", lambda: self._focus_client(key))
+        if hwnd:
+            menu.addAction("Minimize", lambda: window_operations_mod.show_window_async(hwnd, win32con.SW_MINIMIZE))
+            menu.addAction("Restore", lambda: window_operations_mod.show_window_async(hwnd, win32con.SW_RESTORE))
+            if hwnd in self._micro_placements:
+                menu.addAction("Back to Normal Size", lambda: self._unmicro_client(hwnd))
+            else:
+                menu.addAction("Small Window (320×240)", lambda: self._micro_client(hwnd))
+        menu.addSeparator()
+        cpu_menu = menu.addMenu("CPU Limit")
+        current_cap = manual.get("cpu_cap", None)
+        auto = cpu_menu.addAction("Automatic (background limits)")
+        auto.setCheckable(True)
+        auto.setChecked(current_cap is None)
+        auto.triggered.connect(lambda: client_limits_mod.set_manual(key, cpu_cap=None))
+        for percent in (0, 5, 10, 25, 50):
+            action = cpu_menu.addAction("No limit" if percent == 0 else f"{percent}% of the CPU")
+            action.setCheckable(True)
+            action.setChecked(current_cap == percent)
+            action.triggered.connect(lambda _=False, p=percent: client_limits_mod.set_manual(key, cpu_cap=p))
+        eco = menu.addAction("Efficiency Mode")
+        eco.setCheckable(True)
+        eco.setChecked(bool(applied.get("efficiency")))
+        eco.setToolTip("Lower priority and Windows' EcoQoS: less power and heat for a background client")
+        eco.triggered.connect(lambda on: client_limits_mod.set_manual(key, efficiency=bool(on)))
+        menu.addAction("Trim Memory Now", lambda: self._trim_client(key))
+        servers = client_history_mod.recent_servers(username) if username else []
+        if servers:
+            recent = menu.addMenu("Send to a Recent Server")
+            for row in servers[:8]:
+                place = row.get("place_id", "")
+                name = self._game_names.get(place) or f"Place {place}"
+                ago = _short_duration(time.time() - float(row.get("at", 0)))
+                recent.addAction(
+                    f"{name}  ·  {row['job_id'][:8]}  ·  {ago} ago",
+                    lambda p=place, j=row["job_id"]: self._send_to_server(username, p, j),
+                )
+        menu.addSeparator()
+        menu.addAction("Close Client", lambda: self._close_client(key, username))
+        menu.exec(global_pos)
+
+    def _micro_client(self, hwnd: int) -> None:
+        try:
+            placement = win32gui.GetWindowPlacement(hwnd)
+            left, top, _right, _bottom = win32gui.GetWindowRect(hwnd)
+            self._micro_placements[hwnd] = placement
+            window_grid_mod._place_window(hwnd, left + 7, top, 320, 240)
+        except Exception as exc:
+            print(f"[WARNING] Couldn't shrink that client: {exc}")
+
+    def _unmicro_client(self, hwnd: int) -> None:
+        placement = self._micro_placements.pop(hwnd, None)
+        if placement is not None:
+            try:
+                win32gui.SetWindowPlacement(hwnd, placement)
+            except Exception as exc:
+                print(f"[WARNING] Couldn't restore that client's size: {exc}")
+
+    def _trim_client(self, key) -> None:
+        before = self._client_snapshot(key).get("rss_mb", 0)
+        if client_limits_mod.trim(key):
+            print(f"[INFO] Trimmed a client's memory ({before:.0f} MB in use before)")
+
+    def _send_to_server(self, username: str, place_id: str, job_id: str) -> None:
+        if not self._confirm_launch("Join a Recent Server", [username]):
+            return
+        actions.join_job_id(self.manager, [username], place_id, job_id, on_done=self._emit_launch_done)
+
+    def _close_client(self, key, username: str) -> None:
+        name = username or f"PID {key[0]}"
+        if QMessageBox.question(
+            self, "Close Client", f"Close the Roblox client for {name}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        tracker = client_tracker_mod.get_tracker(self.manager)
+        threading.Thread(target=tracker.close, args=(tuple(key),), daemon=True, name="close-client").start()
+
+    def _on_clients_tile(self) -> None:
+        settings = actions.load_ui_settings()
+        result = window_grid_mod.tile_roblox_windows(
+            int(settings.get("window_grid_max_width", 0) or 0),
+            int(settings.get("window_grid_max_height", 0) or 0),
+        )
+        if not result:
+            self._show_operation_error(result)
+        QTimer.singleShot(300, self._refresh_client_thumbnails)
+
+    def _show_all_clients(self, command: int) -> None:
+        for client in self._latest_clients:
+            hwnd = int(client.get("hwnd") or 0)
+            if hwnd:
+                window_operations_mod.show_window_async(hwnd, command)
+        QTimer.singleShot(400, self._refresh_client_thumbnails)
+
+    def _stop_everything(self, confirm: bool = False) -> None:
+        """Stop All / the panic hotkey: auto-rejoin stops, then every Roblox client ends."""
+        if confirm and QMessageBox.question(
+            self, "Stop All",
+            "End every Roblox client and stop auto-rejoin for all accounts?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        for worker in list(self._ar_workers.values()):
+            worker.stop(join_timeout=0.2)
+        self._ar_workers.clear()
+        if self._ar_list is not None:
+            self._ar_refresh_list()
+        tracker = client_tracker_mod.get_tracker(self.manager)
+
+        def _close_all():
+            closed = tracker.close_all()
+            print(f"[INFO] Stop All: auto-rejoin stopped, {closed} client(s) closed")
+
+        threading.Thread(target=_close_all, daemon=True, name="stop-all").start()
+
+    def _apply_panic_hotkey(self) -> None:
+        if self._panic_hotkey_hwnd:
+            window_grid_mod.unregister_hotkey(self._panic_hotkey_hwnd, window_grid_mod.PANIC_HOTKEY_ID)
+            self._panic_hotkey_hwnd = 0
+        settings = actions.load_ui_settings()
+        if not settings.get("panic_hotkey_enabled", False):
+            return
+        sequence = str(settings.get("panic_hotkey", "Ctrl+Alt+End") or "Ctrl+Alt+End")
+        hwnd = int(self.winId())
+        result = window_grid_mod.register_hotkey(hwnd, sequence, window_grid_mod.PANIC_HOTKEY_ID)
+        if result:
+            self._panic_hotkey_hwnd = hwnd
+            print(f"[INFO] Stop All hotkey: {sequence}")
+        else:
+            print(f"[WARNING] Stop All hotkey {sequence} couldn't be set: {result.message}")
+
+    def _show_crash_history(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Crash History")
+        dialog.resize(720, 420)
+        lay = QVBoxLayout(dialog)
+        tree = QTreeWidget()
+        tree.setHeaderLabels(["When", "Account", "What", "Reason", "Ran for"])
+        tree.setRootIsDecorated(False)
+        for row in client_history_mod.crashes():
+            when = time.strftime("%d %b %H:%M", time.localtime(row.get("at", 0)))
+            tree.addTopLevelItem(QTreeWidgetItem([
+                when, row.get("account") or "?", row.get("kind", ""),
+                row.get("reason", ""), _short_duration(row.get("uptime", 0)),
+            ]))
+        for column, width in enumerate((110, 140, 100, 260)):
+            tree.setColumnWidth(column, width)
+        lay.addWidget(tree, 1)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        clear_btn = QPushButton("Clear")
+        clear_btn.clicked.connect(lambda: (client_history_mod.clear_crashes(), tree.clear()))
+        buttons.addWidget(clear_btn)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        buttons.addWidget(close_btn)
+        lay.addLayout(buttons)
+        dialog.exec()
+
+    # Settings helpers for the Performance / Recovery / Automation pages
+    def _choose_main_accounts(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Main Accounts")
+        dialog.resize(360, 420)
+        lay = QVBoxLayout(dialog)
+        note = QLabel(
+            "Main accounts keep your own Roblox graphics and are never limited\n"
+            "in the background. Tick the accounts you play on yourself."
+        )
+        note.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        lay.addWidget(note)
+        chosen = set(actions.get_ui_setting("full_quality_accounts", []) or [])
+        listing = QListWidget()
+        for username in sorted(self.manager.accounts, key=str.lower):
+            item = QListWidgetItem(username)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if username in chosen else Qt.CheckState.Unchecked)
+            listing.addItem(item)
+        lay.addWidget(listing, 1)
+        save = QPushButton("Save")
+        save.setObjectName("primary")
+        save.clicked.connect(dialog.accept)
+        lay.addWidget(save)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            picked = [
+                listing.item(i).text() for i in range(listing.count())
+                if listing.item(i).checkState() == Qt.CheckState.Checked
+            ]
+            actions.save_ui_setting("full_quality_accounts", picked)
+            if hasattr(self, "_main_accounts_lbl"):
+                self._main_accounts_lbl.setText(self._main_accounts_text())
+
+    def _main_accounts_text(self) -> str:
+        picked = actions.get_ui_setting("full_quality_accounts", []) or []
+        return ", ".join(picked) if picked else "None"
+
+    def _on_free_resize_toggled(self, enabled: bool) -> None:
+        if enabled:
+            free_resize_mod.get().start()
+        else:
+            free_resize_mod.get().stop()
+
+    def _on_bandwidth_apply(self) -> None:
+        kbps = self._bandwidth_spin.value()
+
+        def _apply():
+            result = bandwidth_mod.apply(kbps)
+            print(f"[{'INFO' if result else 'ERROR'}] Bandwidth: {result.message or f'{kbps} kbit/s for all Roblox clients'}")
+
+        threading.Thread(target=_apply, daemon=True, name="bandwidth").start()
+
+    def _on_bandwidth_clear(self) -> None:
+        threading.Thread(
+            target=lambda: print(f"[INFO] Bandwidth limit {'removed' if bandwidth_mod.clear() else 'not removed'}"),
+            daemon=True, name="bandwidth",
+        ).start()
+
+    def _on_profile_copy(self) -> None:
+        QApplication.clipboard().setText(perf_profiles_mod.to_code())
+        print("[INFO] Performance profile code copied")
+
+    def _on_profile_import(self) -> None:
+        code, ok = QInputDialog.getMultiLineText(self, "Import Performance Profile", "Paste a share code:")
+        if ok and code.strip():
+            self._apply_profile_text(code)
+
+    def _on_profile_export_file(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "Export Performance Profile", "night-manager-performance.json", "JSON (*.json)")
+        if path:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(perf_profiles_mod.current(), handle, indent=2)
+
+    def _on_profile_import_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Import Performance Profile", "", "JSON (*.json)")
+        if path:
+            with open(path, "r", encoding="utf-8") as handle:
+                self._apply_profile_text(handle.read(8192))
+
+    def _apply_profile_text(self, text: str) -> None:
+        try:
+            profile = perf_profiles_mod.from_code(text)
+        except (ValueError, json.JSONDecodeError) as exc:
+            _show_error(self, "Profile Not Imported", str(exc))
+            return
+        diff = perf_profiles_mod.changes(profile)
+        if not diff:
+            _show_info(self, "Nothing to Change", "Your performance settings already match that profile.")
+            return
+        lines = "\n".join(f"• {label}: {before} → {after}" for label, before, after in diff)
+        if QMessageBox.question(
+            self, "Apply Performance Profile", f"This changes:\n\n{lines}\n\nApply it?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes:
+            perf_profiles_mod.apply(profile)
+            self._on_free_resize_toggled(bool(actions.get_ui_setting("free_resize_enabled", False)))
+            _show_info(self, "Profile Applied", "Reopen Settings to see the new values.")
+
+    def _start_roblox_update_check(self) -> None:
+        launcher = str(actions.get_ui_setting("roblox_launcher", "default") or "default")
+
+        def _check():
+            result = roblox_update_mod.check(launcher)
+            payload = {"ok": bool(result), "message": result.message, **(result.data or {})}
+            if result and not result.data.get("current") and not result.data.get("managed") and result.data.get("installed"):
+                print(f"[INFO] A Roblox update is out ({result.data.get('latest')}); install it from Settings > Performance")
+            self._bridge.roblox_update_status.emit(payload)
+
+        threading.Thread(target=_check, daemon=True, name="roblox-version-check").start()
+
+    def _on_roblox_update_status(self, status: dict) -> None:
+        self._roblox_update_state = status
+        if not hasattr(self, "_roblox_update_lbl"):
+            return
+        if status.get("installing"):
+            text = status.get("message", "")
+        elif not status.get("ok"):
+            text = status.get("message") or "Roblox's version couldn't be checked."
+        elif status.get("managed"):
+            text = f"Latest Roblox: {status.get('latest')}. Your launcher brings its own Roblox and updates it."
+        elif not status.get("installed"):
+            text = f"Latest Roblox: {status.get('latest')}. Roblox isn't installed in its usual folder."
+        elif status.get("current"):
+            text = f"Roblox is up to date ({status.get('latest')})."
+        else:
+            text = f"A Roblox update is out: {status.get('latest')}."
+        self._roblox_update_lbl.setText(text)
+        self._roblox_update_btn.setEnabled(
+            bool(status.get("ok")) and not status.get("current") and not status.get("managed")
+            and not status.get("installing")
+        )
+
+    def _on_roblox_update_install(self) -> None:
+        state = getattr(self, "_roblox_update_state", {}) or {}
+        upload = state.get("upload", "")
+        if not upload:
+            return
+
+        def _install():
+            report = lambda text: self._bridge.roblox_update_status.emit({**state, "installing": True, "message": text})
+            result = roblox_update_mod.install(upload, report)
+            print(f"[{'SUCCESS' if result else 'ERROR'}] {result.message}")
+            self._start_roblox_update_check()
+
+        threading.Thread(target=_install, daemon=True, name="roblox-install").start()
+
+    def _on_backup_export(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Accounts Backup", f"night-manager-accounts{backup_mod.EXTENSION}",
+            f"NIGHT MANAGER backup (*{backup_mod.EXTENSION})",
+        )
+        if not path:
+            return
+        password, ok = QInputDialog.getText(
+            self, "Backup Password",
+            "Choose a password for this backup (8+ characters).\nAnyone with the file and the password gets these accounts.",
+            QLineEdit.EchoMode.Password,
+        )
+        if not ok:
+            return
+        again, ok = QInputDialog.getText(self, "Backup Password", "Type it again:", QLineEdit.EchoMode.Password)
+        if not ok or again != password:
+            _show_error(self, "Backup Not Saved", "The passwords didn't match.")
+            return
+        with self.manager._accounts_lock:
+            accounts = {name: dict(data) for name, data in self.manager.accounts.items()}
+        result = backup_mod.export(path, accounts, password)
+        if result:
+            _show_info(self, "Backup Saved", result.message)
+        else:
+            self._show_operation_error(result)
+
+    def _on_backup_import(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Accounts Backup", "", f"NIGHT MANAGER backup (*{backup_mod.EXTENSION})",
+        )
+        if not path:
+            return
+        password, ok = QInputDialog.getText(self, "Backup Password", "This backup's password:", QLineEdit.EchoMode.Password)
+        if not ok:
+            return
+        result = backup_mod.read(path, password)
+        if not result:
+            self._show_operation_error(result)
+            return
+        accounts = result.data
+        existing = [name for name in accounts if name in self.manager.accounts]
+        replace = False
+        if existing:
+            answer = QMessageBox.question(
+                self, "Accounts Already Here",
+                f"{len(existing)} of the {len(accounts)} accounts are already saved.\n\n"
+                "Replace them with the backup's copies? (No keeps yours.)",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
+            )
+            if answer == QMessageBox.StandardButton.Cancel:
+                return
+            replace = answer == QMessageBox.StandardButton.Yes
+        added, skipped = backup_mod.merge(self.manager, accounts, replace=replace)
+        self._refresh_account_list()
+        _show_info(self, "Backup Imported", f"Added {added} account(s); kept {skipped} you already had.")
+
+    def _on_auto_shutdown_set(self) -> None:
+        at = self._auto_shutdown_time.time()
+        now = time.localtime()
+        target = time.mktime((now.tm_year, now.tm_mon, now.tm_mday, at.hour(), at.minute(), 0, 0, 0, -1))
+        if target <= time.time():
+            target += 24 * 3600
+        actions.save_ui_setting("auto_shutdown_at", target)
+        self._update_auto_shutdown_status()
+        print(f"[INFO] Auto-shutdown set for {time.strftime('%a %H:%M', time.localtime(target))}")
+
+    def _on_auto_shutdown_cancel(self) -> None:
+        actions.save_ui_setting("auto_shutdown_at", 0)
+        self._update_auto_shutdown_status()
+        print("[INFO] Auto-shutdown cancelled")
+
+    def _update_auto_shutdown_status(self) -> None:
+        at = float(actions.get_ui_setting("auto_shutdown_at", 0) or 0)
+        self._auto_shutdown_status.setText(
+            f"Set for {time.strftime('%a %H:%M', time.localtime(at))}" if at else "Off"
+        )
+
+    def _run_auto_shutdown(self) -> None:
+        print("[WARNING] Auto-shutdown: closing every client; the PC shuts down in 60 s (run 'shutdown /a' to stop it)")
+        self._stop_everything(confirm=False)
+        subprocess.Popen(
+            ["shutdown", "/s", "/t", "60", "/c", "NIGHT MANAGER auto-shutdown"],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
 
     # Charts tab
     def _build_charts_panel(self) -> QWidget:
@@ -8811,6 +10155,28 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             on_done=self._emit_launch_done
         )
 
+    def _on_join_same_server(self, mode: str):
+        usernames = self._get_selected_usernames()
+        if len(usernames) < 2:
+            _show_error(self, "Select Accounts", "Select two or more accounts to put in one server.")
+            return
+        text = self._place_id_edit.currentText().strip()
+        parsed = launch_target_mod.parse(text) if text else {"kind": "Invalid", "reason": launch_target_mod.EMPTY}
+        if parsed["kind"] != "Place":
+            _show_error(
+                self, "Public Game Needed",
+                "Same server works with a public game: enter its Place ID or game link.",
+            )
+            return
+        if not self._guard_invalid(usernames):
+            return
+        if not self._confirm_launch("Join the Same Server", usernames):
+            return
+        actions.join_same_server(
+            self.manager, usernames, str(parsed["place_id"]), mode,
+            on_done=self._emit_launch_done,
+        )
+
     # Edit Note
     def _on_edit_note(self):
         usernames = self._get_selected_usernames()
@@ -9188,7 +10554,10 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             f"<a href='{UPSTREAM_REPOSITORY}' style='color: {ACCENT_TEXT};'>Evanovar RAM</a> "
             "by evanovar, released under the "
             "<a href='https://www.gnu.org/licenses/gpl-3.0.html' "
-            f"style='color: {ACCENT_TEXT};'>GNU GPL v3</a>."
+            f"style='color: {ACCENT_TEXT};'>GNU GPL v3</a>. Client tracking, recovery, limits and "
+            "link parsing are adapted from "
+            f"<a href='https://github.com/inspectsoftware/RoALT' style='color: {ACCENT_TEXT};'>RoALT</a> "
+            "by inspectsoftware (MIT)."
         )
         credit_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         credit_lbl.setWordWrap(True)

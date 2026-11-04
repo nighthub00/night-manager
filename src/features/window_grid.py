@@ -18,6 +18,8 @@ import features.presence as presence_mod
 
 DEFAULT_HOTKEY = "Ctrl+Shift+A"
 HOTKEY_ID = 0x52414D47
+# Stop All (panic) shares the registration code under its own id.
+PANIC_HOTKEY_ID = 0x52414D48
 WM_HOTKEY = 0x0312
 
 _MOD_ALT = 0x0001
@@ -132,7 +134,7 @@ def _parse_hotkey(sequence: str) -> tuple[int, int] | None:
     return modifiers | _MOD_NOREPEAT, virtual_key
 
 
-def register_hotkey(window_handle: int, sequence: str) -> OperationResult:
+def register_hotkey(window_handle: int, sequence: str, hotkey_id: int = HOTKEY_ID) -> OperationResult:
     parsed = _parse_hotkey(sequence)
     if not parsed:
         return OperationResult.failure(
@@ -146,7 +148,7 @@ def register_hotkey(window_handle: int, sequence: str) -> OperationResult:
     modifiers, virtual_key = parsed
     if _user32.RegisterHotKey(
         wintypes.HWND(window_handle),
-        HOTKEY_ID,
+        hotkey_id,
         modifiers,
         virtual_key,
     ):
@@ -170,17 +172,17 @@ def register_hotkey(window_handle: int, sequence: str) -> OperationResult:
     )
 
 
-def unregister_hotkey(window_handle: int) -> None:
+def unregister_hotkey(window_handle: int, hotkey_id: int = HOTKEY_ID) -> None:
     if window_handle:
-        _user32.UnregisterHotKey(wintypes.HWND(window_handle), HOTKEY_ID)
+        _user32.UnregisterHotKey(wintypes.HWND(window_handle), hotkey_id)
 
 
-def is_hotkey_message(message) -> bool:
+def is_hotkey_message(message, hotkey_id: int = HOTKEY_ID) -> bool:
     try:
         native_message = wintypes.MSG.from_address(int(message))
         return (
             native_message.message == WM_HOTKEY
-            and int(native_message.wParam) == HOTKEY_ID
+            and int(native_message.wParam) == hotkey_id
         )
     except Exception:
         return False

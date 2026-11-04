@@ -21,7 +21,7 @@ from .encryption import (
     PasswordEncryption,
 )
 from .operation_result import OperationResult, unexpected_result
-from .roblox_api import RobloxAPI
+from .roblox_api import RobloxAPI, set_cookie_rotation_sink
 from utils.app_paths import get_data_dir
 from utils.atomic_file import write_json_atomic
 
@@ -135,6 +135,18 @@ class RobloxAccountManager:
         
         self.accounts = self.load_accounts()
         self.temp_profile_dir = None
+        set_cookie_rotation_sink(self._on_cookie_rotated)
+
+    def _on_cookie_rotated(self, old_cookie, new_cookie):
+        # Roblox replaced an account's .ROBLOSECURITY: save the new one before the old one
+        # stops working, or the account would read as expired months from now.
+        with self._accounts_lock:
+            for username, data in self.accounts.items():
+                if isinstance(data, dict) and data.get('cookie') == old_cookie:
+                    data['cookie'] = new_cookie
+                    self.save_accounts()
+                    print(f"[INFO] Roblox refreshed {username}'s sign-in; the new cookie is saved")
+                    return
 
     def set_pre_launch_hook(self, callback) -> None:
         # Set the callback that runs before Roblox launches.
@@ -1150,16 +1162,38 @@ class RobloxAccountManager:
                     exc,
                 )
 
+        from features import launch_settings
+
         cookie = self.accounts[username]['cookie']
-        launched = RobloxAPI.launch_roblox(
-            username,
-            cookie,
-            game_id,
-            private_server_id,
-            launcher_preference,
-            job_id,
-            custom_launcher_path,
-        )
+        # The launch's own FPS cap / graphics go in just for this client; the user's come back
+        # once it has read them.
+        try:
+            hold = launch_settings.begin(username)
+        except Exception as exc:
+            print(f"[WARNING] Launch settings skipped: {type(exc).__name__}: {exc}")
+            hold = None
+        started = time.time()
+        launched = None
+        try:
+            launched = RobloxAPI.launch_roblox(
+                username,
+                cookie,
+                game_id,
+                private_server_id,
+                launcher_preference,
+                job_id,
+                custom_launcher_path,
+            )
+        finally:
+            if hold is not None:
+                if launched:
+                    hold.release_after_read(getattr(launched, "data", None), started)
+                else:
+                    hold.release()
+        if launched:
+            # The tracker names this client after the account before its log says who it is.
+            from features.client_tracker import get_tracker
+            get_tracker(self).note_launch(username, getattr(launched, "data", None))
         if launched and self.accounts[username].get('cookie_valid') is not True:
             with self._accounts_lock:
                 self.accounts[username]['cookie_valid'] = True

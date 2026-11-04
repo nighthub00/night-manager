@@ -1,12 +1,22 @@
 import threading
 from urllib.parse import urlencode, urlparse
 
+from http.cookiejar import DefaultCookiePolicy
+
 import requests
 
 from classes.operation_result import OperationResult
+from classes.roblox_api import install_cookie_rotation_hook
 
 
 API_ROOT = 'https://games.roblox.com'
+
+
+def _session(cookie):
+    session = requests.Session()
+    session.cookies.set_policy(DefaultCookiePolicy(allowed_domains=[]))
+    session.headers['Cookie'] = f'.ROBLOSECURITY={cookie}'
+    return install_cookie_rotation_hook(session)
 
 
 def _failure(code, message, detail=''):
@@ -123,10 +133,12 @@ def generate_link(cookie, server_id, place_id='', cancel=None):
         return _failure('PLACE_ID_INVALID', 'Roblox did not provide a valid Place ID for this server.')
     if cancel.is_set():
         return _failure('CANCELLED', 'Request cancelled.')
-    with requests.Session() as session:
-        session.headers['Cookie'] = f'.ROBLOSECURITY={cookie}'
+    with _session(cookie) as session:
         try:
-            token_response = session.post('https://auth.roblox.com/v2/logout', timeout=(5, 10),
+            # Read-only endpoint for the CSRF token: /v2/logout ends the session if a token
+            # ever goes along with it.
+            token_response = session.post('https://presence.roblox.com/v1/presence/users',
+                                          json={'userIds': []}, timeout=(5, 10),
                                           allow_redirects=False)
         except requests.Timeout:
             return _failure('NETWORK_TIMEOUT', 'Roblox did not respond in time. Try again.')
@@ -187,8 +199,7 @@ def load_servers(cookie, user_id, place_id='', cancel=None, on_progress=None):
         return _failure('ACCOUNT_ID_MISSING', 'Refresh this account before searching by Place ID.')
     path = (f'/v1/games/{place_id}/private-servers' if place_id
             else '/v1/private-servers/my-private-servers')
-    with requests.Session() as session:
-        session.headers['Cookie'] = f'.ROBLOSECURITY={cookie}'
+    with _session(cookie) as session:
         rows = []
         seen_ids = set()
         cursors = set()

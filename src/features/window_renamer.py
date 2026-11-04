@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import os
-import re
 import threading
 import time
 
@@ -21,10 +20,6 @@ from features.window_operations import set_window_title
 
 _LOG_EARLY_TOLERANCE_SEC = 2.0
 _LOG_STARTUP_WINDOW_SEC = 60.0
-_TRACKER_PATTERN = re.compile(
-    r"browsertrackerid[^0-9]{0,32}(\d+)",
-    re.IGNORECASE,
-)
 _EVIDENCE_TIMESTAMP = 1
 _EVIDENCE_OPEN_FILE = 2
 _EVIDENCE_TRACKER = 3
@@ -196,36 +191,19 @@ class RobloxWindowRenamer:
 
     @staticmethod
     def _extract_process_tracker(process: psutil.Process) -> str:
-        try:
-            command_line = " ".join(str(value) for value in process.cmdline())
-            matches = set(_TRACKER_PATTERN.findall(command_line))
-            if len(matches) == 1:
-                return next(iter(matches))
-        except (
-            OSError,
-            psutil.NoSuchProcess,
-            psutil.AccessDenied,
-            psutil.ZombieProcess,
-        ):
-            pass
+        # The tracker id sits in the client's command line, and reading that means reading
+        # the client's memory (PROCESS_VM_READ). The open log below is just as exact.
         return ""
 
     @classmethod
     def _get_open_log_paths(cls, process: psutil.Process) -> set[str]:
-        paths: set[str] = set()
+        # Asked of the log files (which processes hold them open), so no handle on the
+        # client and none of its handles copied, unlike psutil's open_files().
         try:
-            for opened_file in process.open_files():
-                path = str(getattr(opened_file, "path", "") or "")
-                if path.lower().endswith("_last.log"):
-                    paths.add(cls._normalized_path(path))
-        except (
-            OSError,
-            psutil.NoSuchProcess,
-            psutil.AccessDenied,
-            psutil.ZombieProcess,
-        ):
-            pass
-        return paths
+            path = presence_mod.open_log_for_pid(process.pid, process.create_time())
+        except (OSError, psutil.Error):
+            return set()
+        return {cls._normalized_path(path)} if path else set()
 
     @staticmethod
     def _process_is_current(key: tuple[int, float]) -> bool:

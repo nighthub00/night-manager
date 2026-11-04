@@ -16,6 +16,7 @@ import psutil
 import requests
 from typing import Callable, Optional
 from classes.roblox_api import RobloxAPI
+from features import client_tracker, discord_alerts
 import features.presence as presence_mod
 import features.settings_store as settings_store
 from utils.app_paths import get_data_dir
@@ -228,6 +229,71 @@ def find_running_pid_for_user(manager, user_id: str) -> int | None:
         return None
     return max(identities, key=lambda item: item[1])[0]
 
+# How often a monitored client is looked at (its log, window and memory, via the tracker).
+_TICK_SECONDS = 2.0
+_DISCONNECT_GRACE_SECONDS = 30.0
+_TELEPORT_TIMEOUT_SECONDS = 120.0
+_PRESENCE_WITH_LOG_SECONDS = 60
+_TROUBLE_LABELS = {
+    "disconnected": "Disconnect detected",
+    "crashed": "Client crashed or was closed",
+    "hung": "Client not responding",
+    "memory": "Client over the memory limit",
+    "left": "Left the game",
+}
+# Troubles a relaunch can't fix; rejoining would make them worse.
+_STOPS = {
+    "left": "you left the game",
+    "elsewhere": "account signed in elsewhere",
+    "challenge": "Roblox wants a human check, open the account in a browser",
+}
+
+
+def _signed_in_elsewhere(reason: str) -> bool:
+    text = reason or ""
+    return "273" in text or "Same account" in text or "DuplicateLogin" in text
+
+
+# Crash breaker: at most N relaunches of one account per window, with growing waits.
+_BREAKER_LOCK = threading.Lock()
+_RELAUNCHES: dict[str, list[float]] = {}
+
+
+def _breaker_recent(account: str, window_seconds: float) -> list[float]:
+    now = time.time()
+    with _BREAKER_LOCK:
+        recent = [at for at in _RELAUNCHES.get(account, []) if now - at < window_seconds]
+        _RELAUNCHES[account] = recent
+        return recent
+
+
+def _breaker_count(account: str) -> int:
+    with _BREAKER_LOCK:
+        return len(_RELAUNCHES.get(account, []))
+
+
+def _breaker_backoff(account: str, settings: dict) -> float | None:
+    """Seconds to wait before the next relaunch, or None when the breaker has tripped."""
+    limit = int(settings.get("recovery_breaker_max", 3) or 0)
+    if limit <= 0:
+        return 0.0
+    window = max(1, int(settings.get("recovery_breaker_window_min", 10) or 10)) * 60
+    recent = _breaker_recent(account, window)
+    if len(recent) >= limit:
+        return None
+    return 0.0 if not recent else float(min(300, 10 * 2 ** (len(recent) - 1)))
+
+
+def _breaker_note(account: str) -> None:
+    with _BREAKER_LOCK:
+        _RELAUNCHES.setdefault(account, []).append(time.time())
+
+
+def reset_breaker(account: str) -> None:
+    with _BREAKER_LOCK:
+        _RELAUNCHES.pop(account, None)
+
+
 _presence_lock = threading.Lock()
 _presence_next_time = 0.0
 
@@ -261,6 +327,8 @@ class AutoRejoinWorker:
         self._thread: Optional[threading.Thread] = None
         self._process_identity: RobloxProcessIdentity | None = None
         self._owned_processes: set[RobloxProcessIdentity] = set()
+        self._next_presence = 0.0
+        self._presence_fails = 0
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -428,6 +496,84 @@ class AutoRejoinWorker:
             print(f"[Auto-Rejoin] [{self.account}] Presence error: {e}")
             return "unavailable", ""
 
+    def _check_client(
+        self,
+        tracker,
+        user_id,
+        cookie: str,
+        place_id: str,
+        check_presence: bool,
+        check_place_id: bool,
+        check_interval: int,
+    ) -> tuple[str | None, str]:
+        """What, if anything, is wrong with the account's client: None, or one of
+        _TROUBLE_LABELS / _STOPS, plus the server to go back to ('' for a fresh one)."""
+        identity = self._process_identity
+        client = tracker.get(identity) if identity else None
+        facts = client.facts if client else None
+
+        if not identity or not _identity_matches(identity):
+            # Gone. Its log says whether the player left or Roblox dropped it.
+            if facts and facts.disconnected and facts.left and not facts.teleporting:
+                return "left", ""
+            if facts and facts.disconnected:
+                return "disconnected", self._log_server(facts, place_id)
+            return "crashed", self._log_server(facts, place_id)
+
+        if client is not None and client.tail is not None:
+            tail = client.tail
+            if facts.challenged:
+                return "challenge", ""
+            # A teleport can disconnect and join again within seconds, logged or not:
+            # a disconnect only counts once no new join followed for a while.
+            if (
+                facts.disconnected
+                and not facts.teleporting
+                and tail.disconnected_for() >= _DISCONNECT_GRACE_SECONDS
+            ):
+                if facts.left and _signed_in_elsewhere(facts.reason):
+                    return "elsewhere", ""
+                return "disconnected", self._log_server(facts, place_id)
+            if facts.teleporting and tail.teleporting_for() >= _TELEPORT_TIMEOUT_SECONDS:
+                return "disconnected", ""
+
+        if client is not None:
+            if client.hung and settings_store.get("recovery_restart_on_hang", False):
+                return "hung", ""
+            if tracker.memory_high(client):
+                return "memory", self._log_server(facts, place_id)
+
+        # The presence API is the fallback: always when the client's log isn't found, and for
+        # the place check at most once a minute (Roblox limits cookie APIs per account).
+        if check_presence and time.monotonic() >= self._next_presence:
+            has_log = bool(client and client.tail)
+            if not has_log or check_place_id:
+                self._next_presence = time.monotonic() + (
+                    max(_PRESENCE_WITH_LOG_SECONDS, check_interval) if has_log else check_interval
+                )
+                state, game_id = self._is_in_game(
+                    user_id,
+                    self._current_cookie(cookie),
+                    place_id,
+                    check_place_id,
+                )
+                if state == "in_game":
+                    self._presence_fails = 0
+                elif state == "disconnected":
+                    self._presence_fails += 1
+                    if self._presence_fails >= 2:
+                        self._presence_fails = 0
+                        return "disconnected", game_id or ""
+        return None, ""
+
+    @staticmethod
+    def _log_server(facts, place_id: str) -> str:
+        # Back into the same server only when it was the configured place, not a sub-place
+        # a teleport went to.
+        if facts and facts.job_id and str(facts.place_id) == str(place_id):
+            return facts.job_id
+        return ""
+
     def _run(self) -> None:
         cfg = self.config
         place_id = str(cfg.get("place_id", ""))
@@ -466,7 +612,6 @@ class AutoRejoinWorker:
             return
 
         retry_count = 0
-        consec_fails = 0
 
         if not self._process_identity or not _identity_matches(self._process_identity):
             while not self._stop.is_set():
@@ -513,138 +658,144 @@ class AutoRejoinWorker:
                     return
 
         self._emit(f"ACTIVE - Place {place_id}")
+        tracker = client_tracker.get_tracker(self.manager)
+        self._next_presence = time.monotonic() + check_interval
 
         while not self._stop.is_set():
             try:
-                disconnected = False
-                game_id = ""
-
-                if check_presence:
-                    presence_state, gid = self._is_in_game(
-                        user_id,
-                        self._current_cookie(cookie),
-                        place_id,
-                        check_place_id,
-                    )
-                    game_id = gid or ""
-                    if presence_state == "in_game":
-                        disconnected = False
-                        consec_fails = 0
-                    elif presence_state == "unavailable":
-                        consec_fails = 0
-                        if self._wait(check_interval):
-                            break
-                        continue
-                    else:
-                        consec_fails += 1
-                        if consec_fails < 2:
-                            if self._wait(check_interval):
-                                break
-                            continue
-                        disconnected = True
-                else:
-                    if (
-                        self._process_identity
-                        and not _identity_matches(self._process_identity)
-                    ):
-                        consec_fails += 1
-                        if consec_fails < 2:
-                            if self._wait(check_interval):
-                                break
-                            continue
-                        disconnected = True
-                    else:
-                        consec_fails = 0
-
-                if disconnected:
-                    retry_count  += 1
-                    consec_fails = 0
-                    print(f"[Auto-Rejoin] [{self.account}] Disconnect detected, attempt {retry_count}/{max_retries}")
-                    self._emit(f"Rejoining... ({retry_count}/{max_retries})")
-
-                    identities_to_close = set(self._owned_processes)
-                    if self._process_identity:
-                        identities_to_close.add(self._process_identity)
-                    identities_to_close.update(
-                        find_running_processes_for_user(
-                            self.manager,
-                            str(user_id),
-                        )
-                    )
-
-                    cleanup_ok = True
-                    for identity in sorted(
-                        identities_to_close,
-                        key=lambda item: item[1],
-                    ):
-                        closed, detail = _terminate_process(
-                            identity,
-                            self.account,
-                            self._stop,
-                        )
-                        if not closed:
-                            cleanup_ok = False
-                            print(
-                                f"[Auto-Rejoin] [{self.account}] Cleanup "
-                                f"failed for PID {identity[0]}: {detail}"
-                            )
-
-                    if not cleanup_ok:
-                        self._emit("Rejoin delayed: closing old client")
-                        if self._wait(check_interval):
-                            break
-                        continue
-
-                    self._process_identity = None
-                    self._owned_processes.clear()
-
-                    while not self._stop.is_set() and not self._can_launch():
-                        if self._wait(check_interval):
-                            break
-
-                    if self._stop.is_set():
+                trouble, game_id = self._check_client(
+                    tracker,
+                    user_id,
+                    cookie,
+                    place_id,
+                    check_presence,
+                    check_place_id,
+                    check_interval,
+                )
+                if trouble is None:
+                    retry_count = 0
+                    if self._stop.wait(_TICK_SECONDS):
                         break
+                    continue
 
-                    rejoin_jid = job_id if job_id else game_id
-                    existing_processes = find_running_processes_for_user(
+                settings = settings_store.load()
+                if trouble == "left" and settings.get("recovery_rejoin_after_leave", False):
+                    trouble = "disconnected"
+                if trouble in _STOPS:
+                    message = _STOPS[trouble]
+                    print(f"[Auto-Rejoin] [{self.account}] Stopped: {message}")
+                    self._emit(f"STOPPED: {message}")
+                    break
+
+                backoff = _breaker_backoff(self.account, settings)
+                if backoff is None:
+                    message = (
+                        f"crash breaker, {_breaker_count(self.account)} relaunches in "
+                        f"{int(settings.get('recovery_breaker_window_min', 10))} min"
+                    )
+                    print(f"[Auto-Rejoin] [{self.account}] Stopped: {message}")
+                    self._emit(f"STOPPED: {message}")
+                    discord_alerts.notify("breaker", self.account, f"Stopped after a {message}.")
+                    break
+
+                retry_count += 1
+                print(
+                    f"[Auto-Rejoin] [{self.account}] {_TROUBLE_LABELS[trouble]}, "
+                    f"attempt {retry_count}/{max_retries}"
+                )
+                self._emit(f"Rejoining... ({retry_count}/{max_retries})")
+
+                identities_to_close = set(self._owned_processes)
+                if self._process_identity:
+                    identities_to_close.add(self._process_identity)
+                identities_to_close.update(
+                    find_running_processes_for_user(
                         self.manager,
                         str(user_id),
                     )
-                    if existing_processes:
-                        self._owned_processes = existing_processes
-                        self._process_identity = max(
-                            existing_processes,
-                            key=lambda item: item[1],
-                        )
-                        ok = True
+                )
+
+                cleanup_ok = True
+                for identity in sorted(
+                    identities_to_close,
+                    key=lambda item: item[1],
+                ):
+                    tracker.mark_closing(identity)
+                    closed, detail = _terminate_process(
+                        identity,
+                        self.account,
+                        self._stop,
+                    )
+                    if not closed:
+                        cleanup_ok = False
                         print(
-                            f"[Auto-Rejoin] [{self.account}] Adopted existing "
-                            f"PID {self._process_identity[0]} instead of relaunching"
-                        )
-                    else:
-                        ok = self._launch_and_track(
-                            str(user_id),
-                            place_id,
-                            private_server,
-                            rejoin_jid,
+                            f"[Auto-Rejoin] [{self.account}] Cleanup "
+                            f"failed for PID {identity[0]}: {detail}"
                         )
 
-                    if ok:
-                        print(f"[Auto-Rejoin] [{self.account}] Rejoin successful")
-                        retry_count = 0
-                        self._emit(f"ACTIVE - Place {place_id}")
-                        if self._stop.wait(10):
-                            break
-                    else:
-                        self._emit(f"Launch failed ({retry_count}/{max_retries})")
-                        if retry_count >= max_retries:
-                            self._emit("STOPPED: max retries reached")
-                            print(f"[Auto-Rejoin] [{self.account}] Max retries reached, stopping.")
-                            break
-                        if self._wait(check_interval):
-                            break
+                if not cleanup_ok:
+                    self._emit("Rejoin delayed: closing old client")
+                    if self._wait(check_interval):
+                        break
+                    continue
+
+                self._process_identity = None
+                self._owned_processes.clear()
+
+                if backoff > 0:
+                    self._emit(f"Rejoining in {int(backoff)}s (relaunched recently)")
+                    if self._stop.wait(backoff):
+                        break
+
+                while not self._stop.is_set() and not self._can_launch():
+                    if self._wait(check_interval):
+                        break
+
+                if self._stop.is_set():
+                    break
+
+                rejoin_jid = job_id if job_id else game_id
+                existing_processes = find_running_processes_for_user(
+                    self.manager,
+                    str(user_id),
+                )
+                if existing_processes:
+                    self._owned_processes = existing_processes
+                    self._process_identity = max(
+                        existing_processes,
+                        key=lambda item: item[1],
+                    )
+                    ok = True
+                    print(
+                        f"[Auto-Rejoin] [{self.account}] Adopted existing "
+                        f"PID {self._process_identity[0]} instead of relaunching"
+                    )
                 else:
+                    _breaker_note(self.account)
+                    ok = self._launch_and_track(
+                        str(user_id),
+                        place_id,
+                        private_server,
+                        rejoin_jid,
+                    )
+
+                if ok:
+                    print(f"[Auto-Rejoin] [{self.account}] Rejoin successful")
+                    discord_alerts.notify(
+                        "restarted", self.account,
+                        f"{_TROUBLE_LABELS[trouble]}; launched again into place {place_id}.",
+                    )
                     retry_count = 0
+                    self._presence_fails = 0
+                    self._emit(f"ACTIVE - Place {place_id}")
+                    if self._stop.wait(10):
+                        break
+                else:
+                    self._emit(f"Launch failed ({retry_count}/{max_retries})")
+                    if retry_count >= max_retries:
+                        self._emit("STOPPED: max retries reached")
+                        print(f"[Auto-Rejoin] [{self.account}] Max retries reached, stopping.")
+                        break
                     if self._wait(check_interval):
                         break
 

@@ -8,7 +8,10 @@ from __future__ import annotations
 import threading
 import requests
 import time
+from http.cookiejar import DefaultCookiePolicy
 from typing import Callable
+
+from classes.roblox_api import install_cookie_rotation_hook
 
 VALID = "valid"
 INVALID = "invalid"
@@ -134,6 +137,9 @@ class CookieValidator:
         unknown = 0
         rate_limited = False
         session = requests.Session()
+        # No jar: one account's rotated cookie must never ride along on the next check.
+        session.cookies.set_policy(DefaultCookiePolicy(allowed_domains=[]))
+        install_cookie_rotation_hook(session)
 
         try:
             for username, data in accounts_snapshot:

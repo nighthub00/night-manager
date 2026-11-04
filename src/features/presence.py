@@ -17,6 +17,8 @@ import win32api
 import win32gui
 import win32process
 
+from features import roblox_logs
+
 
 _TRACKER_PATTERN = re.compile(
     r"browsertrackerid[^0-9]{0,32}(\d+)",
@@ -50,6 +52,14 @@ def _get_user_id_from_pid(
     return entry.user_id if entry else None
 
 
+def open_log_for_pid(pid: int, create_time: float) -> str:
+    """The Player log this client holds open, asked of the log files (no handle on Roblox)."""
+    for path, _ in roblox_logs.player_logs(since=create_time - 5.0):
+        if pid in roblox_logs.pids_using_file(path):
+            return path
+    return ""
+
+
 def _get_log_entry_from_pid(
     pid: int,
     used_logs: set[str] | None = None,
@@ -60,6 +70,20 @@ def _get_log_entry_from_pid(
             proc.create_time(),
             tz=timezone.utc,
         ).replace(tzinfo=None)
+
+        # Exact: the log the client itself has open. Until it has written its user id
+        # there's nothing to match yet, which beats guessing from timestamps.
+        own_log = open_log_for_pid(pid, proc.create_time())
+        if own_log:
+            own_norm = os.path.normcase(own_log)
+            for entry in get_roblox_log_entries(
+                earliest_time=create_utc - timedelta(seconds=_LOG_EARLY_TOLERANCE_SEC),
+            ):
+                if os.path.normcase(entry.path) == own_norm:
+                    if used_logs is not None:
+                        used_logs.add(entry.path)
+                    return entry
+            return None
 
         # Log names carry whole seconds, so a log opened in the same second the
         # process started can be stamped slightly before its sub-second create time.
@@ -112,7 +136,7 @@ def get_roblox_log_entries(
 
     current_paths: set[str] = set()
     for filename in filenames:
-        if not filename.endswith("_last.log"):
+        if not filename.endswith("_last.log") or "_CrashHandler_" in filename:
             continue
         match = re.search(r"(\d{8}T\d{6}Z)", filename)
         if not match:

@@ -28,6 +28,7 @@ from typing import Callable
 from classes.operation_result import OperationResult, ensure_result, unexpected_result
 from classes.roblox_api import RobloxAPI
 import features.browsers as browsers_mod
+import features.discord_alerts as discord_alerts
 import features.headless_manager as headless_manager_mod
 import features.presence as presence_mod
 import features.settings_store as settings_store_mod
@@ -99,6 +100,24 @@ def save_ui_setting(key: str, value) -> None:
     settings_store_mod.save(key, value)
 
 
+# The webhook URL holds the webhook's token, so it lives with the encrypted account data;
+# the rest of the Discord settings stay in the settings file.
+_discord_url_provider: Callable[[], str] | None = None
+
+
+def set_discord_url_provider(provider: Callable[[], str]) -> None:
+    global _discord_url_provider
+    _discord_url_provider = provider
+    discord_alerts.set_url_provider(provider)
+
+
+def get_discord_config() -> dict:
+    config = dict(get_ui_setting("discord_webhook", {}) or {})
+    # Until the account data is open there is no URL, so nothing is sent.
+    config["url"] = _discord_url_provider() if _discord_url_provider else ""
+    return config
+
+
 # Game name lookup
 def fetch_game_name(place_id: str) -> str:
     try:
@@ -118,6 +137,8 @@ def _batch_launch_result(
     failures: list[tuple[str, OperationResult]],
 ) -> OperationResult:
     summary = f"{action} {success_count}/{total} accounts."
+    if total > 1:
+        discord_alerts.notify("batch", "", summary)
     if not failures:
         return OperationResult.success(summary)
 
@@ -685,6 +706,133 @@ def join_small_server(manager, usernames: list[str] | str, place_id: str, on_don
 
     threading.Thread(target=_worker, daemon=True, name="smalljoin-all").start()
 
+def pick_server_with_room(place_id: str, needed: int, cookie: str = "") -> dict | None:
+    """The fullest public server that still has room for `needed` more players, so a batch
+    lands together (None when no server has that much room). One page of the emptiest
+    servers: the fullest ones come first in descending order and rarely fit a batch."""
+    headers = {"Cookie": f".ROBLOSECURITY={cookie}"} if cookie else {}
+    response = requests.get(
+        f"https://games.roblox.com/v1/games/{place_id}/servers/Public"
+        "?sortOrder=Asc&excludeFullGames=true&limit=100",
+        headers=headers,
+        timeout=10,
+    )
+    response.raise_for_status()
+    fitting = [
+        server for server in response.json().get("data", [])
+        if server.get("id")
+        and int(server.get("maxPlayers", 0)) - int(server.get("playing", 0)) >= needed
+    ]
+    if not fitting:
+        return None
+    return max(fitting, key=lambda server: int(server.get("playing", 0)))
+
+
+def _wait_for_server(manager, username: str, timeout: float = 90.0) -> tuple[str, str]:
+    """(place_id, job_id) the account's newest client reached, read from its own log;
+    the presence API is the fallback. ('', '') when it never got into a server."""
+    from features.client_tracker import get_tracker
+    tracker = get_tracker(manager)
+    user_id = str(manager.accounts.get(username, {}).get("user_id", "") or "")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        newest = None
+        for client in tracker.clients():
+            if client.username == username or (user_id and client.user_id == user_id):
+                if newest is None or client.create_time > newest.create_time:
+                    newest = client
+        if newest is not None and newest.facts.in_game and newest.facts.job_id:
+            return newest.facts.place_id, newest.facts.job_id
+        time.sleep(2.0)
+    cookie = manager.accounts.get(username, {}).get("cookie", "")
+    if user_id and cookie:
+        presence = RobloxAPI.get_player_presence(user_id, cookie) or {}
+        if presence.get("in_game") and presence.get("game_id"):
+            return str(presence.get("place_id") or ""), str(presence["game_id"])
+    return "", ""
+
+
+def join_same_server(
+    manager,
+    usernames: list[str],
+    place_id: str,
+    mode: str = "pick",
+    on_done: Callable[[bool, str], None] = lambda *_: None,
+) -> None:
+    """Launch a batch into one public server. "pick": find a server with room for everyone
+    first. "follow": launch the first account, then send the rest to wherever it landed.
+    A pick that finds no room falls back to follow."""
+    S = load_ui_settings()
+    launcher = S.get("roblox_launcher", "default")
+    custom_path = S.get("custom_roblox_launcher_path", "")
+    launch_delay = get_launch_delay_seconds(S)
+    print(f"[INFO] Same server ({mode}): {len(usernames)} accounts -> place {place_id}")
+
+    def _launch(username: str, job_id: str = "") -> OperationResult:
+        try:
+            return ensure_result(manager.launch_roblox(
+                username, place_id,
+                job_id=job_id,
+                launcher_preference=launcher,
+                custom_launcher_path=custom_path,
+            ))
+        except Exception as exc:
+            return unexpected_result(f"Joining the same server with {username}", exc)
+
+    def _worker():
+        success = 0
+        failures: list[tuple[str, OperationResult]] = []
+        job_id = ""
+        rest = list(usernames)
+        follow = mode == "follow"
+        if not follow:
+            try:
+                cookie = manager.accounts.get(usernames[0], {}).get("cookie", "")
+                server = pick_server_with_room(place_id, len(usernames), cookie)
+            except Exception as exc:
+                print(f"[WARNING] Same server: server list unavailable ({type(exc).__name__}); following the first account")
+                server = None
+            if server:
+                job_id = str(server["id"])
+                print(
+                    f"[INFO] Same server: picked a server with "
+                    f"{server.get('playing')}/{server.get('maxPlayers')} players"
+                )
+            else:
+                print("[INFO] Same server: no server has room for everyone; following the first account")
+                follow = True
+        if follow:
+            first = rest.pop(0)
+            result = _launch(first)
+            if result:
+                success += 1
+                print(f"[INFO] Same server: waiting for {first} to get into a server...")
+                landed_place, job_id = _wait_for_server(manager, first)
+                if job_id and landed_place and landed_place != str(place_id):
+                    print("[INFO] Same server: the first account went to a sub-place; the rest join the game normally")
+                    job_id = ""
+                if not job_id:
+                    print("[WARNING] Same server: couldn't tell which server the first account joined")
+            else:
+                failures.append((first, result))
+            if rest:
+                _wait_between_launches(0, 2, launch_delay, rest[0])
+        for index, username in enumerate(rest):
+            result = _launch(username, job_id)
+            if result:
+                success += 1
+            else:
+                failures.append((username, result))
+            print(f"[{'SUCCESS' if result else 'ERROR'}] Same server {username}: {'OK' if result else 'FAIL'}")
+            if index < len(rest) - 1:
+                _wait_between_launches(index, len(rest), launch_delay, rest[index + 1])
+        result = _batch_launch_result("Joined", len(usernames), success, failures)
+        print(f"[INFO] Same server done: {result.message}")
+        on_done(bool(result), result)
+
+    threading.Thread(target=_worker, daemon=True, name="same-server").start()
+
+
 def fetch_game_name_async(place_id: str, on_done: Callable[[str], None] = lambda _: None) -> None:
     def _worker():
         name = fetch_game_name(place_id)
@@ -869,10 +1017,12 @@ def add_account_browser(manager, on_done: Callable[[bool, str], None] = lambda *
 _afk_thread: threading.Thread | None = None
 _afk_stop_event = threading.Event()
 _afk_trigger_event = threading.Event()
-_afk_key: str = "w"
+_afk_key: str = "f13"
 _afk_press_count: int = 1
 _afk_interval: int = 10          # minutes
 _afk_tooltip_enabled: bool = True
+_afk_only_when_idle: bool = True
+_afk_last_injected_tick: int = 0
 
 _afk_tooltip_callback: Callable[[str | None, int, int], None] | None = None
 
@@ -894,6 +1044,9 @@ _AFK_WHEEL_DELTA = 120
 _AFK_XBUTTON1 = 0x0001
 _AFK_XBUTTON2 = 0x0002
 _AFK_RETRY_SECONDS = 15
+# A scheduled pass waits until nobody has touched the PC for this long, and backs off when they do.
+_AFK_IDLE_MS = 5000
+_AFK_BUSY_RETRY_SECONDS = 30
 
 
 class _AfkKeyboardInput(ctypes.Structure):
@@ -1017,7 +1170,45 @@ def _send_afk_input(input_event: _AfkInput) -> bool:
     ]
     user32.SendInput.restype = wintypes.UINT
     sent = user32.SendInput(1, ctypes.byref(input_event), ctypes.sizeof(_AfkInput))
+    # Our own presses move GetLastInputInfo too; remember them so they don't read as the user.
+    global _afk_last_injected_tick
+    _afk_last_injected_tick = ctypes.windll.kernel32.GetTickCount()
     return sent == 1
+
+
+class _LastInputInfo(ctypes.Structure):
+    _fields_ = [("size", wintypes.UINT), ("time", wintypes.DWORD)]
+
+
+def _last_input_tick() -> int:
+    info = _LastInputInfo(ctypes.sizeof(_LastInputInfo), 0)
+    if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+        return 0
+    return int(info.time)
+
+
+def _tick_after(later: int, earlier: int) -> bool:
+    # 32-bit tick counts wrap every 49 days; compare through the difference.
+    return 0 < ((later - earlier) & 0xFFFFFFFF) < 0x80000000
+
+
+def user_idle_ms() -> int:
+    """Milliseconds since the last keyboard or mouse input anywhere on this PC."""
+    last = _last_input_tick()
+    if not last:
+        return 0
+    return (ctypes.windll.kernel32.GetTickCount() - last) & 0xFFFFFFFF
+
+
+def _user_input_since(tick: int) -> bool:
+    """True when someone used the keyboard or mouse after `tick`, not counting our presses."""
+    last = _last_input_tick()
+    if not last:
+        return False
+    newest_own = tick
+    if _tick_after(_afk_last_injected_tick, newest_own):
+        newest_own = _afk_last_injected_tick
+    return _tick_after(last, (newest_own + 50) & 0xFFFFFFFF)
 
 
 def _get_afk_virtual_key(action_key: str) -> tuple[int, bool] | None:
@@ -1026,7 +1217,8 @@ def _get_afk_virtual_key(action_key: str) -> tuple[int, bool] | None:
         return _AFK_VIRTUAL_KEYS[normalized], normalized in _AFK_EXTENDED_KEYS
     if normalized.startswith("f") and normalized[1:].isdigit():
         function_number = int(normalized[1:])
-        if 1 <= function_number <= 12:
+        # F13-F24 too: no game binds F13, so a press keeps a client active without moving it.
+        if 1 <= function_number <= 24:
             return 0x70 + function_number - 1, False
     if len(normalized) == 1:
         user32 = ctypes.windll.user32
@@ -1216,13 +1408,15 @@ def _update_afk_tooltip(message: str | None) -> None:
         except Exception:
             pass
 
-def start_anti_afk(key: str = "w", press_count: int = 1, interval: int = 10,
-                   tooltip_enabled: bool = True) -> None:
+def start_anti_afk(key: str = "f13", press_count: int = 1, interval: int = 10,
+                   tooltip_enabled: bool = True, only_when_idle: bool = True) -> None:
     global _afk_thread, _afk_key, _afk_press_count, _afk_interval, _afk_tooltip_enabled
+    global _afk_only_when_idle
     _afk_key = key
     _afk_press_count = press_count
     _afk_interval = interval
     _afk_tooltip_enabled = tooltip_enabled
+    _afk_only_when_idle = bool(only_when_idle)
     stop_anti_afk()
     _afk_stop_event.clear()
     _afk_trigger_event.clear()
@@ -1283,6 +1477,26 @@ def _afk_worker():
             if _afk_stop_event.is_set():
                 break
 
+            # Taking focus while someone types or plays would steal their input, so a
+            # scheduled pass waits for a quiet moment (a manual trigger goes at once).
+            if _afk_only_when_idle and not triggered:
+                announced = False
+                while user_idle_ms() < _AFK_IDLE_MS:
+                    if not announced:
+                        print(
+                            f"[Anti-AFK] You're using the PC; trying again every "
+                            f"{_AFK_BUSY_RETRY_SECONDS}s"
+                        )
+                        announced = True
+                    if _afk_trigger_event.wait(_AFK_BUSY_RETRY_SECONDS):
+                        _afk_trigger_event.clear()
+                        triggered = True
+                        break
+                    if _afk_stop_event.is_set():
+                        break
+                if _afk_stop_event.is_set():
+                    break
+
             roblox_pids = set(presence_mod.get_roblox_processes(force=True))
             if not roblox_pids:
                 print("[Anti-AFK] No Roblox processes found")
@@ -1302,9 +1516,19 @@ def _afk_worker():
 
             manager = headless_manager_mod.get_active_manager()
             successful_actions = 0
+            pass_started = ctypes.windll.kernel32.GetTickCount()
+            interrupted = False
             try:
                 for state in window_states:
                     if _afk_stop_event.is_set():
+                        break
+                    if (
+                        _afk_only_when_idle
+                        and not triggered
+                        and _user_input_since(pass_started)
+                    ):
+                        interrupted = True
+                        print("[Anti-AFK] You touched the PC; pass stopped, retrying soon")
                         break
 
                     pid = state["pid"]
@@ -1342,7 +1566,9 @@ def _afk_worker():
             finally:
                 _restore_afk_window_states(window_states, original_hwnd)
 
-            if successful_actions == len(window_states):
+            if interrupted:
+                next_wait_seconds = _AFK_BUSY_RETRY_SECONDS
+            elif successful_actions == len(window_states):
                 next_wait_seconds = max(60, _afk_interval * 60)
             else:
                 next_wait_seconds = _AFK_RETRY_SECONDS
@@ -1367,10 +1593,13 @@ _mr_h64_stop_event: threading.Event | None = None
 _mr_h64_session_id = 0
 _mr_h64_worker_threads: set[threading.Thread] = set()
 _mr_h64_worker_lock = threading.Lock()
+# Current clients create an event named exactly ROBLOX_singletonEvent and signal it to make
+# the running client quit; a mutex holding that name first makes their CreateEvent fail.
+# ROBLOX_singletonMutex is left alone: clients wait on it while one hands over to another
+# during an update, and holding it can stall them.
 _MR_SINGLETON_NAMES = (
     "ROBLOX_SingletonEvent",
     "ROBLOX_singletonEvent",
-    "ROBLOX_singletonMutex",
 )
 _MR_H64_PROCESS_GONE = "process_gone"
 _MR_H64_PROCESS_REPLACED = "process_replaced"
@@ -1809,6 +2038,42 @@ def _mr_h64_close_handles(
             closed_pids.add(pid)
     return closed_pids
 
+def _lock_shared_roblox_file(path: str) -> dict | None:
+    if not os.path.exists(path):
+        return None
+    handle = None
+    try:
+        handle = open(path, "r+b")
+        length = max(1, os.path.getsize(path))
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, length)
+        print(f"[Multi Roblox] Locked {os.path.basename(path)} while clients run.")
+        return {"file": handle, "length": length, "name": os.path.basename(path)}
+    except OSError as exc:
+        print(f"[Multi Roblox] Could not lock {os.path.basename(path)}: {exc}")
+        if handle:
+            try:
+                handle.close()
+            except Exception:
+                pass
+        return None
+
+
+def _unlock_shared_roblox_file(lock: dict) -> None:
+    handle = lock.get("file")
+    if not handle:
+        return
+    try:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, lock.get("length", 1))
+    except Exception as exc:
+        print(f"[Multi Roblox] Failed to unlock {lock.get('name', 'file')}: {exc}")
+    try:
+        handle.close()
+    except Exception:
+        pass
+
+
 def enable_multi_roblox(method: str = "default") -> tuple[bool, str]:
     global _mr_handle
     global _mr_h64_monitoring, _mr_h64_thread, _mr_h64_path
@@ -1871,7 +2136,8 @@ def enable_multi_roblox(method: str = "default") -> tuple[bool, str]:
         for singleton_name in _MR_SINGLETON_NAMES:
             try:
                 ctypes.set_last_error(0)
-                mutex = kernel32.CreateMutexW(None, True, singleton_name)
+                # Only the name matters; nothing ever waits on it, so it isn't owned.
+                mutex = kernel32.CreateMutexW(None, False, singleton_name)
                 mutex_error = ctypes.get_last_error()
                 if not mutex:
                     mutex_failures.append((singleton_name, mutex_error))
@@ -1880,15 +2146,15 @@ def enable_multi_roblox(method: str = "default") -> tuple[bool, str]:
                         f"{singleton_name}: {mutex_error}"
                     )
                     continue
-                mutex_owned = mutex_error != 183
+                created = mutex_error != 183
                 mutexes.append({
                     "name": singleton_name,
                     "handle": mutex,
-                    "owned": mutex_owned,
+                    "owned": False,
                 })
-                if mutex_owned:
+                if created:
                     print(
-                        f"[Multi Roblox] Mutex created and owned: "
+                        f"[Multi Roblox] Mutex created: "
                         f"{singleton_name}"
                     )
                 else:
@@ -1952,11 +2218,18 @@ def enable_multi_roblox(method: str = "default") -> tuple[bool, str]:
     else:
         print("[Multi Roblox] RobloxCookies.dat not found, 773 fix skipped.")
 
+    # Clients also share appStorage.json; left writable, the last one to start
+    # rewrites which account the others (and the Roblox app) think is signed in.
+    app_storage_lock = _lock_shared_roblox_file(
+        os.path.join(os.getenv("LOCALAPPDATA", ""), r"Roblox\LocalStorage\appStorage.json")
+    )
+
     _mr_handle = {
         "mode": "default",
         "mutexes": mutexes,
         "file": cookie_file,
         "cookie_lock": cookie_lock,
+        "extra_locks": [app_storage_lock] if app_storage_lock else [],
     }
     print("[Multi Roblox] Started (default mode)")
     return True, ""
@@ -2103,6 +2376,8 @@ def disable_multi_roblox():
                 f.close()
             except Exception:
                 pass
+        for extra in state.get("extra_locks") or []:
+            _unlock_shared_roblox_file(extra)
 
         mutexes = list(state.get("mutexes") or [])
         if not mutexes and state.get("mutex"):

@@ -14,6 +14,7 @@ import shutil
 import threading
 from http.cookiejar import DefaultCookiePolicy
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .operation_result import OperationResult, unexpected_result
 
@@ -21,16 +22,76 @@ _THREAD_LOCAL = threading.local()
 _CSRF_TTL_SECONDS = 600
 _CSRF_LOCK = threading.Lock()
 _CSRF_CACHE: dict[str, tuple[float, str]] = {}
+_COOKIE_PREFIX = "_|WARNING:-DO-NOT-SHARE-THIS."
+_SENT_COOKIE = re.compile(r"\.ROBLOSECURITY=([^;]+)")
+_cookie_rotation_sink = None
+
+
+def set_cookie_rotation_sink(callback) -> None:
+    """`callback(old_cookie, new_cookie)` runs when Roblox hands out a new .ROBLOSECURITY."""
+    global _cookie_rotation_sink
+    _cookie_rotation_sink = callback
+
+
+def _is_roblox_host(url: str) -> bool:
+    host = (urlparse(str(url or "")).hostname or "").lower()
+    return host == "roblox.com" or host.endswith(".roblox.com")
+
+
+def rotated_cookie(response) -> tuple[str, str] | None:
+    # Since 2026 Roblox rotates .ROBLOSECURITY through Set-Cookie on ordinary API
+    # responses and later refuses the old value, so a new one must be kept.
+    if not _is_roblox_host(getattr(response, "url", "")):
+        return None
+    try:
+        new = response.cookies.get(".ROBLOSECURITY", domain=None) or ""
+    except Exception:
+        # Several cookies under that name (one per domain): take any real one.
+        new = next(
+            (c.value for c in response.cookies if c.name == ".ROBLOSECURITY" and c.value),
+            "",
+        )
+    # A sign-out clears the cookie with an empty value; only a real session counts.
+    if not new.startswith(_COOKIE_PREFIX):
+        return None
+    request = getattr(response, "request", None)
+    sent = (request.headers.get("Cookie", "") if request is not None else "") or ""
+    match = _SENT_COOKIE.search(sent)
+    old = match.group(1).strip() if match else ""
+    if not old or old == new:
+        return None
+    return old, new
+
+
+def _note_rotated_cookie(response, *args, **kwargs):
+    sink = _cookie_rotation_sink
+    if sink is None:
+        return
+    try:
+        pair = rotated_cookie(response)
+        if pair:
+            sink(*pair)
+    except Exception as exc:
+        print(f"[WARNING] Could not keep a refreshed Roblox cookie: {type(exc).__name__}")
+
+
+def install_cookie_rotation_hook(session: requests.Session) -> requests.Session:
+    hooks = session.hooks.setdefault("response", [])
+    if _note_rotated_cookie not in hooks:
+        hooks.append(_note_rotated_cookie)
+    return session
 
 
 def _http() -> requests.Session:
     # A pooled session per thread skips a TLS handshake on every call (~40% faster).
     # It never stores cookies: Roblox answers with Set-Cookie, and a shared jar would
-    # send one account's cookies along with another account's requests.
+    # send one account's cookies along with another account's requests. A rotated
+    # .ROBLOSECURITY is handed to the account store by the response hook instead.
     session = getattr(_THREAD_LOCAL, "session", None)
     if session is None:
         session = requests.Session()
         session.cookies.set_policy(DefaultCookiePolicy(allowed_domains=[]))
+        install_cookie_rotation_hook(session)
         _THREAD_LOCAL.session = session
     return session
 
@@ -280,13 +341,17 @@ class RobloxAPI:
             if cached and time.monotonic() - cached[0] < _CSRF_TTL_SECONDS:
                 return cached[1]
 
-        url = "https://auth.roblox.com/v2/logout"
+        # Any write endpoint answers a request without a token with 403 + x-csrf-token.
+        # This one only reads presence; /v2/logout would end the session if a token
+        # ever went along.
+        url = "https://presence.roblox.com/v1/presence/users"
         headers = {
-            'Cookie': f'.ROBLOSECURITY={cookie}'
+            'Cookie': f'.ROBLOSECURITY={cookie}',
+            'Content-Type': 'application/json',
         }
 
         try:
-            response = _http().post(url, headers=headers, timeout=5)
+            response = _http().post(url, headers=headers, json={"userIds": []}, timeout=5)
             token = response.headers.get('x-csrf-token')
             _remember_csrf(cookie, token)
             return token
@@ -430,6 +495,23 @@ class RobloxAPI:
         return None
     
     @staticmethod
+    def get_client_assertion(roblosecurity_cookie) -> dict:
+        """The website's `{clientAssertion}` for the ticket request; `{}` when Roblox has none."""
+        try:
+            response = _http().get(
+                "https://auth.roblox.com/v1/client-assertion/",
+                headers={"Cookie": f".ROBLOSECURITY={roblosecurity_cookie}"},
+                timeout=6,
+            )
+            if response.status_code == 200:
+                data = response.json()
+                if isinstance(data, dict) and data.get("clientAssertion"):
+                    return {"clientAssertion": str(data["clientAssertion"])}
+        except (requests.RequestException, ValueError):
+            pass
+        return {}
+
+    @staticmethod
     def get_auth_ticket(roblosecurity_cookie):
         """Get authentication ticket for launching Roblox games"""
         if not str(roblosecurity_cookie or "").strip():
@@ -447,11 +529,13 @@ class RobloxAPI:
             "Content-Type": "application/json",
             "Cookie": f".ROBLOSECURITY={roblosecurity_cookie}"
         }
+        # roblox.com's Play button sends this assertion as the ticket request's body.
+        body = RobloxAPI.get_client_assertion(roblosecurity_cookie)
 
         try:
             csrf_token = ""
             for attempt in range(4):
-                response = _http().post(url, headers=headers, timeout=8)
+                response = _http().post(url, headers=headers, json=body, timeout=8)
                 if response.status_code == 403 and response.headers.get("x-csrf-token"):
                     csrf_token = response.headers["x-csrf-token"]
                     break
@@ -493,7 +577,7 @@ class RobloxAPI:
 
             headers["X-CSRF-TOKEN"] = csrf_token
             for attempt in range(4):
-                response = _http().post(url, headers=headers, timeout=8)
+                response = _http().post(url, headers=headers, json=body, timeout=8)
                 if response.status_code == 200:
                     auth_ticket = response.headers.get("rbx-authentication-ticket")
                     if auth_ticket:
@@ -595,14 +679,22 @@ class RobloxAPI:
                 "+robloxLocale:en_us+gameLocale:en_us"
             )
             print(f"[INFO] Launching Roblox Home for {username}")
-            return RobloxAPI._execute_launch(url, launcher_preference, custom_launcher_path)
+            return RobloxAPI._with_launch_data(
+                RobloxAPI._execute_launch(url, launcher_preference, custom_launcher_path),
+                browser_tracker_id,
+                launch_time,
+            )
 
         link_code = None
+        access_code = None
 
         if private_server_id:
             ps = private_server_id.strip()
             if ps.isdigit():
                 link_code = ps
+            elif re.fullmatch(r"[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", ps):
+                # roblox:// and /games/start links can carry an access code instead.
+                access_code = ps.lower()
             else:
                 resolved_pid, resolved_lc = RobloxAPI.resolve_share_url(ps, cookie=cookie)
                 if resolved_lc:
@@ -641,6 +733,8 @@ class RobloxAPI:
 
         if link_code:
             url += "&linkCode=" + link_code
+        elif access_code:
+            url += "&accessCode=" + access_code
         elif job_id:
             url += "&gameId=" + str(job_id)
 
@@ -651,14 +745,33 @@ class RobloxAPI:
 
         print(f"[INFO] Launching Roblox for {username}...")
         print(f"[INFO] Place ID: {game_id}")
-        if link_code:
-            print(f"[INFO] Private server (link code: {link_code})")
+        if link_code or access_code:
+            # A link or access code lets anyone into the server: never in the log or a webhook.
+            print("[INFO] Private server")
         elif job_id:
             print(f"[INFO] Job ID: {job_id}")
         print(f"[INFO] Launcher: {launcher_preference}")
 
-        return RobloxAPI._execute_launch(url, launcher_preference, custom_launcher_path)
-    
+        return RobloxAPI._with_launch_data(
+            RobloxAPI._execute_launch(url, launcher_preference, custom_launcher_path),
+            browser_tracker_id,
+            launch_time,
+        )
+
+    @staticmethod
+    def _with_launch_data(result, browser_tracker_id, launch_time):
+        # The client logs this tracker id first thing, which ties its log (and so its
+        # process) to this launch for rejoin, limits and the Clients page.
+        if not result:
+            return result
+        return OperationResult.success(
+            result.message,
+            data={
+                "browser_tracker_id": str(browser_tracker_id),
+                "launch_time": launch_time / 1000.0,
+            },
+        )
+
     @staticmethod
     def _execute_launch(url, launcher_preference, custom_launcher_path=""):
         """Execute the Roblox launch with the specified launcher"""
