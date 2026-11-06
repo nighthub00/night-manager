@@ -17,6 +17,8 @@ datas = [
     (str(ASSETS_ROOT / "icon.ico"), "assets"),
     (str(ASSETS_ROOT / "discordlogo.png"), "assets"),
     (str(ASSETS_ROOT / "logo.png"), "assets"),
+    # Daily Claim's on-screen templates, read next to the module (features/daily_claim).
+    (str(SOURCE_ROOT / "features" / "daily_claim" / "anime_dice_screen.json"), "features/daily_claim"),
 ]
 binaries = []
 hiddenimports = [

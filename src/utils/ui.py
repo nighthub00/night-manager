@@ -109,6 +109,8 @@ import features.window_operations as window_operations_mod
 import features.window_renamer as window_renamer_mod
 import features.windows_startup as windows_startup_mod
 import features.themes as themes_mod
+from features.daily_claim.controller import DailyClaimController
+from utils.daily_claim_page import DailyClaimBridge, DailyClaimPage
 
 
 class _DragDropFilter(QObject):
@@ -452,6 +454,10 @@ WARN = "#F5B64A"
 
 NIGHTHUB_DISCORD = "https://discord.gg/nighthubqx"
 UPSTREAM_REPOSITORY = "https://github.com/evanovar/RobloxAccountManager"
+ROALT_REPOSITORY = "https://github.com/inspectsoftware/RoALT"
+# The Automation hub: one sidebar tab, these pages as its sub-tabs (stack index, label).
+AUTOMATION_TABS = ((10, "Daily Claim"), (1, "Auto-Rejoin"), (2, "Anti AFK"), (3, "Multi Roblox"))
+AUTOMATION_PAGES = frozenset(index for index, _ in AUTOMATION_TABS)
 
 # Line icons (24px grid, stroked) for the sidebar and toolbars.
 _ICON_PATHS = {
@@ -488,8 +494,23 @@ _ICON_PATHS = {
     "clients": '<rect x="2" y="3" width="9" height="7" rx="1.5"/><rect x="13" y="3" width="9" height="7" rx="1.5"/>'
                '<rect x="2" y="14" width="9" height="7" rx="1.5"/><rect x="13" y="14" width="9" height="7" rx="1.5"/>',
     "stop": '<rect x="5" y="5" width="14" height="14" rx="2"/>',
+    "bolt": '<path d="M13 2 4 14h7l-1 8 9-12h-7Z"/>',
+    "calendar": '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>'
+                '<path d="m9 16 2 2 4-4"/>',
 }
 _svg_cache: dict[tuple, QPixmap] = {}
+
+
+def _top_aligned(widget: QWidget) -> QWidget:
+    """Holds `widget` at the top of its page at its natural height."""
+    holder = QWidget()
+    holder.setStyleSheet("background: transparent;")
+    lay = QVBoxLayout(holder)
+    lay.setContentsMargins(8, 0, 8, 8)
+    lay.setSpacing(0)
+    lay.addWidget(widget)
+    lay.addStretch(1)
+    return holder
 
 
 def _svg_pixmap(name: str, color: str, size: int = 16, stroke: float = 2.0) -> QPixmap:
@@ -1879,6 +1900,9 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         self._shutdown_cleanup_done = False
         self._page_hosts: dict[int, _DetachablePageHost] = {}
         self._detached_windows: dict[int, _DetachedPageWindow] = {}
+        self._automation_last = int(actions.get_ui_setting("automation_last_page", 10) or 10)
+        if self._automation_last not in AUTOMATION_PAGES:
+            self._automation_last = 10
         self._page_names = {
             0: "Accounts",
             1: "Auto-Rejoin",
@@ -1889,6 +1913,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             6: "About",
             8: "Charts",
             9: "Clients",
+            10: "Daily Claim",
         }
         self._page_subtitles = {
             0: "Launch, organize and manage your Roblox accounts",
@@ -1901,6 +1926,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             7: "Secure your saved accounts before you start",
             8: "Trending Roblox games: search one and join it with any account",
             9: "Every running client, live: what it is doing and what it uses",
+            10: "Claim Anime Dice's daily reward for many accounts, a few clients at a time",
         }
         self._window_grid_hotkey_registered = False
         self._window_grid_hotkey_hwnd = 0
@@ -2443,6 +2469,16 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             }}
             QTabBar::tab:selected {{ color: {TEXT}; border-bottom: 2px solid {FG_ACCENT}; }}
 
+            QFrame#segmented {{
+                background: {INPUT}; border: 1px solid {LINE}; border-radius: 10px;
+            }}
+            QPushButton#segment {{
+                background: transparent; color: {MUTED}; border: 0; border-radius: 7px;
+                padding: 5px 13px; font-size: 12px; font-weight: 600; min-height: 0;
+            }}
+            QPushButton#segment:hover {{ color: {TEXT}; background: {HOVER}; }}
+            QPushButton#segment:checked {{ color: #FFFFFF; background: {FG_ACCENT}; }}
+
             QGroupBox {{
                 border: 1px solid {LINE}; border-radius: 8px;
                 margin-top: 12px; padding-top: 6px;
@@ -2471,6 +2507,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             6: self._build_donations_panel,
             8: self._build_charts_panel,
             9: self._build_clients_panel,
+            10: self._build_daily_claim_panel,
         }
 
         for index, page_name in self._page_names.items():
@@ -2493,8 +2530,9 @@ class AccountManagerUIQt(QMainWindow): # Main Window
 
         self._page_hosts[0].set_page(_accounts_page)
         self._page_hosts[1].set_page(self._build_auto_rejoin_panel())
-        self._page_hosts[2].set_page(self._build_anti_afk_panel())
-        self._page_hosts[3].set_page(self._build_multi_roblox_panel())
+        # Short settings cards: sized to their content instead of filling the page.
+        self._page_hosts[2].set_page(_top_aligned(self._build_anti_afk_panel()))
+        self._page_hosts[3].set_page(_top_aligned(self._build_multi_roblox_panel()))
         _setup_wrap = QWidget()
         _setup_lay = QVBoxLayout(_setup_wrap)
         _setup_lay.setContentsMargins(10, 4, 10, 10)
@@ -2544,6 +2582,14 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         if not hasattr(self, "_page_title_lbl"):
             return
         title = "Setup" if index == 7 else self._page_names.get(index, "")
+        in_hub = index in AUTOMATION_PAGES
+        if in_hub:
+            title = "Automation"
+            if index != self._automation_last:
+                self._automation_last = index
+                actions.save_ui_setting("automation_last_page", index)
+            self._automation_btns[index].setChecked(True)
+        self._automation_strip.setVisible(in_hub)
         self._page_title_lbl.setText(title)
         self._page_subtitle_lbl.setText(self._page_subtitles.get(index, ""))
 
@@ -2691,7 +2737,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
     def _build_title_bar(self) -> QFrame:
         bar = QFrame()
         bar.setObjectName("titleBar")
-        bar.setFixedHeight(76)
+        bar.setFixedHeight(64)
         self._title_bar = bar
 
         lay = QHBoxLayout(bar)
@@ -2699,8 +2745,8 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         lay.setSpacing(0)
 
         heading = QVBoxLayout()
-        heading.setContentsMargins(0, 14, 0, 10)
-        heading.setSpacing(1)
+        heading.setContentsMargins(0, 11, 0, 8)
+        heading.setSpacing(0)
         self._page_title_lbl = QLabel("")
         self._page_title_lbl.setObjectName("pageTitle")
         self._page_subtitle_lbl = QLabel("")
@@ -2710,6 +2756,29 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         heading.addStretch(1)
         lay.addLayout(heading)
         lay.addStretch(1)
+
+        # Automation sub-tabs: shown only while an automation page is open.
+        self._automation_strip = QFrame()
+        self._automation_strip.setObjectName("segmented")
+        strip_lay = QHBoxLayout(self._automation_strip)
+        strip_lay.setContentsMargins(3, 3, 3, 3)
+        strip_lay.setSpacing(2)
+        self._automation_group = QButtonGroup(self._automation_strip)
+        self._automation_group.setExclusive(True)
+        self._automation_btns: dict[int, QPushButton] = {}
+        for index, label in AUTOMATION_TABS:
+            seg = QPushButton(label)
+            seg.setObjectName("segment")
+            seg.setCheckable(True)
+            seg.setCursor(Qt.CursorShape.PointingHandCursor)
+            seg.clicked.connect(lambda _=False, idx=index: self._show_page(idx))
+            self._automation_group.addButton(seg)
+            strip_lay.addWidget(seg)
+            self._automation_btns[index] = seg
+        self._automation_strip.hide()
+        # Right-aligned, so it stays put while the subtitle changes from tab to tab.
+        lay.addWidget(self._automation_strip, 0, Qt.AlignmentFlag.AlignVCenter)
+        lay.addSpacing(14)
 
         buttons = QHBoxLayout()
         buttons.setContentsMargins(0, 6, 0, 0)
@@ -2818,9 +2887,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             ("Accounts", "accounts", 0),
             ("Clients", "clients", 9),
             ("Charts", "chart", 8),
-            ("Auto-Rejoin", "rejoin", 1),
-            ("Anti AFK", "afk", 2),
-            ("Multi Roblox", "multi", 3),
+            ("Automation", "bolt", 10),
             ("SYSTEM", None, None),
             ("Settings", "settings", 4),
             ("Console", "console", 5),
@@ -2848,18 +2915,27 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             btn.setAutoExclusive(True)
             btn.setChecked(page_idx == 0)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.clicked.connect(
-                lambda _=False, idx=page_idx: self._show_page(idx)
-            )
+            if page_idx in AUTOMATION_PAGES:
+                # One tab for the hub: it opens (and detaches) the sub-page used last.
+                btn.clicked.connect(lambda _=False: self._show_page(self._automation_last))
+                btn.customContextMenuRequested.connect(
+                    lambda pos, button=btn:
+                    self._show_page_context_menu(self._automation_last, button.mapToGlobal(pos))
+                )
+            else:
+                btn.clicked.connect(
+                    lambda _=False, idx=page_idx: self._show_page(idx)
+                )
+                btn.customContextMenuRequested.connect(
+                    lambda pos, button=btn, idx=page_idx:
+                    self._show_page_context_menu(idx, button.mapToGlobal(pos))
+                )
             btn.setToolTip("Right-click for window options")
             btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-            btn.customContextMenuRequested.connect(
-                lambda pos, button=btn, idx=page_idx:
-                self._show_page_context_menu(idx, button.mapToGlobal(pos))
-            )
             lay.addWidget(btn)
             self._normal_nav_btns.append(btn)
-            self._nav_btn_by_page[page_idx] = btn
+            for key in (AUTOMATION_PAGES if page_idx in AUTOMATION_PAGES else (page_idx,)):
+                self._nav_btn_by_page[key] = btn
 
         # Setup nav button
         self._setup_nav_btn = QPushButton("  Setup")
@@ -7716,6 +7792,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
             client_tracker_mod.shutdown,
             client_limits_mod.release_all,
             lambda: free_resize_mod.get().stop(),
+            lambda: self._daily_claim.shutdown() if getattr(self, "_daily_claim", None) else None,
             discord_rpc_mod.PRESENCE.stop,
         ):
             try:
@@ -8953,6 +9030,7 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         if actions.get_ui_setting("free_resize_enabled", False):
             free_resize_mod.get().start()
         self._apply_discord_presence()
+        self._start_daily_claim()
 
         # Housekeeping that runs while the app is open.
         self._housekeeping_timer = QTimer(self)
@@ -9044,6 +9122,26 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         elif event == "joined":
             place = str(snapshot.get("place_id") or "")
             discord_alerts_mod.notify("joined", name, self._game_names.get(place) or f"Place {place}")
+
+    def _start_daily_claim(self) -> None:
+        """Daily Claim Manager: reconcile a session a crash cut short, then run the schedule."""
+        self._daily_claim_bridge = DailyClaimBridge(self)
+        self._daily_claim = DailyClaimController(self.manager, on_event=self._daily_claim_bridge.event.emit)
+
+        def _recover():
+            try:
+                self._daily_claim.recover()
+            except Exception as exc:
+                print(f"[ERROR] Daily Claim recovery: {type(exc).__name__}: {exc}")
+            self._daily_claim.start_scheduler()
+
+        threading.Thread(target=_recover, daemon=True, name="DailyClaim-recover").start()
+
+    def _build_daily_claim_panel(self) -> QWidget:
+        return DailyClaimPage(
+            self._daily_claim, self._daily_claim_bridge,
+            self._get_selected_usernames, groups.get_group_names,
+        )
 
     def _build_clients_panel(self) -> QWidget:
         page = QWidget()
@@ -10547,23 +10645,19 @@ class AccountManagerUIQt(QMainWindow): # Main Window
         discord_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         discord_btn.clicked.connect(lambda: webbrowser.open(NIGHTHUB_DISCORD))
         card_lay.addWidget(discord_btn)
-        card_lay.addSpacing(10)
+        card_lay.addSpacing(2)
 
-        credit_lbl = QLabel(
-            f"{APP_NAME} is a modified version of "
-            f"<a href='{UPSTREAM_REPOSITORY}' style='color: {ACCENT_TEXT};'>Evanovar RAM</a> "
-            "by evanovar, released under the "
-            "<a href='https://www.gnu.org/licenses/gpl-3.0.html' "
-            f"style='color: {ACCENT_TEXT};'>GNU GPL v3</a>. Client tracking, recovery, limits and "
-            "link parsing are adapted from "
-            f"<a href='https://github.com/inspectsoftware/RoALT' style='color: {ACCENT_TEXT};'>RoALT</a> "
-            "by inspectsoftware (MIT)."
+        licenses_btn = QPushButton("Licenses")
+        licenses_btn.setObjectName("linkButton")
+        licenses_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        licenses_btn.setToolTip("Open-source licenses and credits")
+        licenses_btn.setStyleSheet(
+            f"QPushButton#linkButton {{ background: transparent; border: 0; color: {MUTED};"
+            f" font-size: 11px; padding: 2px; }}"
+            f"QPushButton#linkButton:hover {{ color: {ACCENT_TEXT}; text-decoration: underline; }}"
         )
-        credit_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        credit_lbl.setWordWrap(True)
-        credit_lbl.setOpenExternalLinks(True)
-        credit_lbl.setStyleSheet(f"font-size: 11px; color: {MUTED};")
-        card_lay.addWidget(credit_lbl)
+        licenses_btn.clicked.connect(self._show_licenses)
+        card_lay.addWidget(licenses_btn, 0, Qt.AlignmentFlag.AlignHCenter)
 
         h = QHBoxLayout()
         h.addStretch(1)
@@ -10573,6 +10667,28 @@ class AccountManagerUIQt(QMainWindow): # Main Window
 
         outer.addStretch(1)
         return panel
+
+    def _show_licenses(self) -> None:
+        """The notices GPL-3.0 (section 5(d)) and RoALT's MIT licence ask the app to show."""
+        link = f"style='color: {ACCENT_TEXT};'"
+        text = (
+            f"<p><b>{APP_NAME}</b> {APP_VERSION} is a modified version of "
+            f"<a href='{UPSTREAM_REPOSITORY}' {link}>Evanovar RAM</a> by evanovar.</p>"
+            "<p>This program is free software: you can redistribute it and/or modify it under the "
+            f"terms of the <a href='https://www.gnu.org/licenses/gpl-3.0.html' {link}>GNU General "
+            "Public License v3</a>. It comes with ABSOLUTELY NO WARRANTY, to the extent permitted "
+            "by law. The full licence is in the LICENSE file published with the source.</p>"
+            "<p>Client tracking, recovery, limits and link parsing are adapted from "
+            f"<a href='{ROALT_REPOSITORY}' {link}>RoALT</a> by inspectsoftware, MIT licence "
+            "(see THIRD-PARTY-NOTICES.md).</p>"
+        )
+        box = QMessageBox(self)
+        box.setWindowTitle("Licenses")
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        box.setText(text)
+        box.setStandardButtons(QMessageBox.StandardButton.Close)
+        box.exec()
 
     def _build_console_panel(self) -> QFrame: # Console panel
         panel = QFrame()
