@@ -97,6 +97,11 @@ class SimulatedClientManager:
 class RobloxClientManager:
     APPEAR_TIMEOUT = 60.0
     POLL = 0.5
+    # Roblox's "Failed to download or apply critical settings" box has a Retry button, and a
+    # retry a couple of seconds later usually gets through (SslConnectFail on the first fetch
+    # after an idle spell). Pressing it beats closing the client and queueing a new launch.
+    DIALOG_RETRIES = 6
+    DIALOG_RETRY_GAP = 2.5
 
     def __init__(self, manager):
         self._manager = manager
@@ -145,6 +150,7 @@ class RobloxClientManager:
             raise LaunchError(f"Launch failed: {result.message or code}", retryable=retryable)
 
         deadline = started + min(timeout, self.APPEAR_TIMEOUT)
+        retried: dict[int, list[float]] = {}     # pid -> times Retry was pressed
         while time.time() < deadline:
             fresh = []
             for client in tracker.clients():
@@ -162,9 +168,19 @@ class RobloxClientManager:
                     return handle
             for client in fresh:
                 message = roblox_error_dialog(client.pid)
-                if message:
-                    tracker.close(client.key)
-                    raise LaunchError(f"Roblox showed an error before joining: {message}")
+                if not message:
+                    continue
+                presses = retried.setdefault(client.pid, [])
+                if presses and time.time() - presses[-1] < self.DIALOG_RETRY_GAP:
+                    continue
+                if len(presses) < self.DIALOG_RETRIES and press_dialog_retry(client.pid):
+                    presses.append(time.time())
+                    # Each press may take a while to come back; give the join the time.
+                    deadline = max(deadline, time.time() + 30)
+                    continue
+                tracker.close(client.key)
+                tries = f" (pressed Retry {len(presses)} times)" if presses else ""
+                raise LaunchError(f"Roblox showed an error before joining: {message}{tries}")
             if cancel.wait(self.POLL):
                 self._close_unnamed(tracker, before, started)
                 raise LaunchError("cancelled", retryable=False)
@@ -252,6 +268,40 @@ def roblox_error_dialog(pid: int) -> str:
     except Exception:
         return ""
     return found[0] if found else ""
+
+
+def press_dialog_retry(pid: int) -> bool:
+    """Presses Retry on a Roblox message box owned by `pid` (WM_COMMAND IDRETRY, no focus or
+    mouse needed). False when there is no such box or it has no Retry button."""
+    import win32con
+    import win32gui
+    import win32process
+
+    IDRETRY = 4
+    boxes: list[int] = []
+
+    def _top(hwnd, _):
+        try:
+            if (win32gui.IsWindowVisible(hwnd) and win32gui.GetClassName(hwnd) == "#32770"
+                    and win32process.GetWindowThreadProcessId(hwnd)[1] == pid):
+                boxes.append(hwnd)
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumWindows(_top, None)
+        for box in boxes:
+            try:
+                button = win32gui.GetDlgItem(box, IDRETRY)
+            except Exception:
+                button = 0
+            if button:
+                win32gui.PostMessage(box, win32con.WM_COMMAND, IDRETRY, button)
+                return True
+    except Exception:
+        return False
+    return False
 
 
 def process_matches(pid: int, create_time: float) -> bool:

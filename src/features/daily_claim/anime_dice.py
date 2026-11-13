@@ -5,7 +5,13 @@ On-screen clicks: the client is shrunk to a 320 x 240 tile; the Offline Money po
 the Roblox "Join Event" panel is closed, and the Daily Rewards calendar (which Anime Dice opens by
 itself only while a reward is ready) is read and the next day's tile clicked. Success is the tile's
 check, "Next Reward In" or the "Claimed Daily Reward!" toast. Templates: anime_dice_screen.json,
-cut from live captures on 2026-11-06.
+cut from live captures on 2026-11-06 and 2026-11-13.
+
+When the calendar does not open by itself, it is opened from the game's top-bar Daily button.
+At tile size Roblox tucks that button into its overflow menu, so the window is grown to
+`open_size` for a moment (other clients' clicks wait), the button clicked and the window shrunk
+back; the calendar keeps its layout. That turns "already claimed" from a guess into a reading
+of "Next Reward In".
 
 Executor script: the bridge's auto-execute script reports LastDailyRewardClaim and fires
 DailyRewardService Claim on request; success is that value changing.
@@ -13,6 +19,7 @@ DailyRewardService Claim on request; success is that value changing.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 
@@ -27,8 +34,14 @@ from features.daily_claim.adapters import (
 from features.daily_claim.models import Observation, RewardState
 
 # After the Join Event panel shows up with no calendar before it, how long to wait for a
-# calendar hiding behind it before calling the reward already claimed.
+# calendar hiding behind it before opening it from the top-bar button.
 EVENT_GRACE_SECONDS = 8.0
+# How long the game gets to open the calendar by itself (when it does, it is ~30 s in; on
+# 2026-11-13 it mostly did not) before it is opened from the top-bar button.
+OPEN_AFTER_SECONDS = 30.0
+# Tries at opening the calendar from the top-bar button, and the gap between them.
+OPEN_TRIES = 2
+OPEN_GAP_SECONDS = 8.0
 
 
 class AnimeDiceScreenAdapter(AnimeDiceAdapter):
@@ -50,7 +63,7 @@ class AnimeDiceScreenAdapter(AnimeDiceAdapter):
 
     def can_claim(self) -> tuple[bool, str]:
         missing = [k for k in ("calendar", "ready", "next", "toast", "check", "offline", "event_close")
-                   if k not in self.ui.templates]
+                   if k not in self.ui.variants]
         if missing or not self.ui.tiles:
             return False, f"The on-screen profile is incomplete (missing {', '.join(missing) or 'tiles'})."
         return True, ""
@@ -93,6 +106,48 @@ class AnimeDiceScreenAdapter(AnimeDiceAdapter):
     def _click(self, ctx: ClaimContext, x: int, y: int) -> bool:
         return self.backend.click(self._st(ctx)["hwnd"], x, y)
 
+    def _label(self, frame) -> str | None:
+        """"ready" or "next": whichever calendar label matches better."""
+        return self.ui.which(frame, ("ready", "next"))
+
+    def _open_calendar(self, ctx: ClaimContext) -> bool:
+        """Grow the window, click the game's top-bar Daily button, shrink it back. True when
+        the button was found and clicked (the caller checks for the calendar)."""
+        if "daily_button" not in self.ui.variants:
+            return False
+        st = self._st(ctx)
+        hwnd, slot = st["hwnd"], self._slot(ctx.account_id)
+        width, height = self.ui.window
+        big_w, big_h = self.ui.open_size
+        st["open_tries"] = st.get("open_tries", 0) + 1
+        st["last_open"] = time.time()
+        exclusive = getattr(self.backend, "exclusive", None)
+        clicked = False
+        with (exclusive() if exclusive else contextlib.nullcontext()):
+            self.backend.size(hwnd, slot, big_w, big_h)
+            try:
+                hit = None
+                for _ in range(8):
+                    self._wait(ctx, 0.5)
+                    frame = self._frame(ctx)
+                    if frame is None:
+                        continue
+                    if frame.width < big_w * 0.8:
+                        break          # the window did not grow (or this is not a real window)
+                    hit = self.ui.seen(frame, "daily_button", radius=40, full=False)
+                    if hit:
+                        break
+                if hit:
+                    # The label right of the glyph flips between "Daily" and "Claim".
+                    clicked = bool(self._click(ctx, hit[1] + 12, hit[2]))
+                    self._wait(ctx, 1.0)
+            finally:
+                self.backend.size(hwnd, slot, width, height)
+        if clicked:
+            st["opened"] = True
+            self._wait(ctx, 1.5)       # the calendar re-lays out at tile size
+        return clicked
+
     # steps
 
     def wait_until_ready(self, ctx: ClaimContext, timeout: float) -> Observation:
@@ -101,8 +156,10 @@ class AnimeDiceScreenAdapter(AnimeDiceAdapter):
         st["hwnd"] = self._hwnd(ctx)
         width, height = self.ui.window
         self.backend.size(st["hwnd"], self._slot(ctx.account_id), width, height)
-        st.update(calendar=False, event=False, offline_clicks=0, last_offline=0.0, event_at=0.0)
-        deadline = time.time() + min(timeout, self.popup_timeout) if timeout else time.time() + self.popup_timeout
+        st.update(calendar=False, event=False, offline_clicks=0, last_offline=0.0, event_at=0.0,
+                  open_tries=0, last_open=0.0, opened=False)
+        started = time.time()
+        deadline = started + (min(timeout, self.popup_timeout) if timeout else self.popup_timeout)
         frames = 0
         while time.time() < deadline:
             frames += 1
@@ -115,7 +172,9 @@ class AnimeDiceScreenAdapter(AnimeDiceAdapter):
                 continue
             if self.ui.seen(frame, "calendar"):
                 st["calendar"] = True
-                return Observation(RewardState.UNKNOWN, 1.0, "Daily Rewards calendar opened" + self._extras(st), "ui")
+                how = " from the top-bar button" if st["opened"] else ""
+                return Observation(RewardState.UNKNOWN, 1.0,
+                                   f"Daily Rewards calendar opened{how}" + self._extras(st), "ui")
             event = self.ui.seen(frame, "event_close", radius=6, full=False)
             if event:
                 if not st["event"]:
@@ -128,7 +187,14 @@ class AnimeDiceScreenAdapter(AnimeDiceAdapter):
                     self._click(ctx, hit[1], hit[2])       # collect the offline cash
                     st["offline_clicks"] += 1
                     st["last_offline"] = time.time()
-            if st["event"] and time.time() - st["event_at"] > EVENT_GRACE_SECONDS:
+            now = time.time()
+            due = (now - started > OPEN_AFTER_SECONDS
+                   or (st["event"] and now - st["event_at"] > EVENT_GRACE_SECONDS))
+            if due and st["open_tries"] < OPEN_TRIES and now - st["last_open"] > OPEN_GAP_SECONDS:
+                self._open_calendar(ctx)
+                continue
+            if (st["event"] and now - st["event_at"] > EVENT_GRACE_SECONDS
+                    and st["open_tries"] >= OPEN_TRIES and now - st["last_open"] > 4):
                 return Observation(RewardState.UNKNOWN, 0.8,
                                    "Join Event panel came with no calendar before it" + self._extras(st), "ui")
             self._wait(ctx, self.poll)
@@ -141,20 +207,27 @@ class AnimeDiceScreenAdapter(AnimeDiceAdapter):
             bits.append(f"collected Offline Money ({st['offline_clicks']} click(s))")
         if st.get("event"):
             bits.append("closed Roblox's Join Event panel")
+        if st.get("open_tries") and not st.get("opened"):
+            bits.append(f"top-bar Daily button not found ({st['open_tries']} tries)")
         return ("; " + ", ".join(bits)) if bits else ""
 
     def detect_reward(self, ctx: ClaimContext) -> Observation:
         st = self._st(ctx)
         frame = self._frame(ctx)
+        if ((frame is None or not self.ui.seen(frame, "calendar")) and st.get("hwnd")
+                and st.get("open_tries", 0) < OPEN_TRIES + 1 and self._open_calendar(ctx)):
+            frame = self._frame(ctx)
         if frame is not None and self.ui.seen(frame, "calendar"):
+            st["calendar"] = True
             days = self.ui.claimed_days(frame)
             next_day = next((i + 1 for i, done in enumerate(days) if not done), 1)
             ticks = "".join("x" if d else "." for d in days)
-            if self.ui.seen(frame, "ready"):
+            label = self._label(frame)
+            if label == "ready":
                 return Observation(RewardState.AVAILABLE, 0.9,
                                    f"calendar shows 'Reward Ready!' (days {ticks})", "ui", reward_day=next_day)
-            if self.ui.seen(frame, "next"):
-                return Observation(RewardState.CLAIMED, 0.9,
+            if label == "next":
+                return Observation(RewardState.CLAIMED, 0.95,
                                    f"calendar shows 'Next Reward In' (days {ticks})", "ui")
             return Observation(RewardState.UNKNOWN, 0.3, f"calendar open, state label not recognised (days {ticks})", "ui")
         if st.get("event") and not st.get("calendar"):
@@ -190,12 +263,12 @@ class AnimeDiceScreenAdapter(AnimeDiceAdapter):
                 if self.ui.seen(frame, "toast"):
                     return Observation(RewardState.CLAIMED, 0.95, "'Claimed Daily Reward!' toast", "ui")
                 if self.ui.seen(frame, "calendar"):
-                    if self.ui.seen(frame, "next"):
+                    if self._label(frame) == "next":
                         return Observation(RewardState.CLAIMED, 0.95, "calendar now shows 'Next Reward In'", "ui")
                     if self.ui.claimed_days(frame)[index]:
                         return Observation(RewardState.CLAIMED, 0.85, f"Day {index + 1} now has its check", "ui")
             self._wait(ctx, 0.25)
-        if last is not None and self.ui.seen(last, "calendar") and self.ui.seen(last, "ready"):
+        if last is not None and self.ui.seen(last, "calendar") and self._label(last) == "ready":
             return Observation(RewardState.AVAILABLE, 0.8, "calendar still shows 'Reward Ready!'", "ui")
         return Observation(RewardState.UNKNOWN, 0.2, "no sign of the claim after clicking", "ui")
 

@@ -253,7 +253,8 @@ class DailyClaimPage(QWidget):
         elif note:
             banner = f"{note} Live runs and the schedule are held until this is fixed."
         elif settings.claim_method == "screen":
-            banner = ("On-screen clicks: each client is shrunk to a 320×240 tile. Every click briefly "
+            banner = ("On-screen clicks: each client is shrunk to a 320×240 tile (and grown for a moment "
+                      "when the calendar has to be opened from the game's Daily button). Every click briefly "
                       "takes the mouse and focus (one window at a time), so leave the PC alone while it runs.")
         else:
             peers = len(controller.bridge.connected()) if controller.bridge else 0
