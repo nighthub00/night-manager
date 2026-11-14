@@ -383,6 +383,20 @@ class RobloxAccountManager:
             return browser.get(key, default)
         return getattr(browser, key, default)
 
+    @staticmethod
+    def _chromium_major_version(executable_path):
+        # Chromium-based browsers install into a folder named after their version
+        # beside the executable, for example "157.1.99.57" for Chromium 157.
+        try:
+            majors = [
+                int(name.split(".")[0])
+                for name in os.listdir(os.path.dirname(executable_path))
+                if name.split(".")[0].isdigit() and name.count(".") == 3
+            ]
+        except (OSError, ValueError):
+            return ""
+        return str(max(majors)) if majors else ""
+
     def setup_browser_driver(self, browser=None, browser_path=None):
         if browser is None:
             selected_key = "chromium" if browser_path and "chromium" in browser_path.lower() else "chrome"
@@ -434,7 +448,7 @@ class RobloxAccountManager:
                 options.add_argument(profile_dir)
                 options.set_preference("dom.webdriver.enabled", False)
                 options.set_preference("useAutomationExtension", False)
-            elif browser_key in ("chrome", "chromium"):
+            elif browser_key in ("chrome", "chromium", "brave"):
                 from selenium.webdriver.chrome.options import Options
 
                 options = Options()
@@ -466,6 +480,12 @@ class RobloxAccountManager:
                 options.add_argument("--disable-component-update")
                 options.add_argument("--disable-background-networking")
                 options.add_argument("--aggressive-cache-discard")
+                if browser_key == "brave":
+                    # Selenium Manager matches ChromeDriver to a Chrome version,
+                    # so pass Brave's Chromium major version explicitly.
+                    brave_major = self._chromium_major_version(executable_path)
+                    if brave_major:
+                        options.browser_version = brave_major
             elif browser_key == "edge":
                 from selenium.webdriver.edge.options import Options
 
@@ -482,7 +502,7 @@ class RobloxAccountManager:
                 return OperationResult.failure(
                     "BROWSER_SELECTION_INVALID",
                     "Invalid Browser Selection",
-                    "Select Chrome, Firefox, Edge, or Chromium in Browser Engine settings.",
+                    "Select Chrome, Firefox, Edge, Brave, or Chromium in Browser Engine settings.",
                     detail=f"Configured browser: {browser_key}",
                 )
 

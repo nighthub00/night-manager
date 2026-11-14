@@ -244,10 +244,216 @@ def _build_signup_script(profile: dict) -> str:
                 return;
             }}
 
+            if (fillSignupV2()) {{
+                return;
+            }}
+
             if (attemptsLeft > 0) {{
                 setTimeout(
                     function() {{ fillSignup(attemptsLeft - 1); }},
                     250
+                );
+            }}
+        }}
+
+        // Roblox serves two signup layouts. The newer one has no element ids
+        // for the birthday or gender, asks for the password on a second step,
+        // and opens an operating system passkey prompt before that step.
+        function blockPasskeyPrompt() {{
+            function reject() {{
+                return Promise.reject(new DOMException(
+                    'The operation is not allowed.',
+                    'NotAllowedError'
+                ));
+            }}
+            try {{
+                Object.defineProperty(
+                    CredentialsContainer.prototype,
+                    'create',
+                    {{ value: reject, configurable: true }}
+                );
+            }} catch (error) {{}}
+            try {{
+                navigator.credentials.create = reject;
+            }} catch (error) {{}}
+        }}
+
+        function isShown(element) {{
+            if (!element) {{
+                return false;
+            }}
+            if (element.checkVisibility) {{
+                return element.checkVisibility({{
+                    checkOpacity: true,
+                    checkVisibilityCSS: true
+                }});
+            }}
+            return element.offsetParent !== null;
+        }}
+
+        function setNativeValue(element, prototype, value) {{
+            var descriptor = Object.getOwnPropertyDescriptor(prototype, 'value');
+            descriptor.set.call(element, value);
+            element.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            element.dispatchEvent(new Event('change', {{ bubbles: true }}));
+        }}
+
+        function getV2Parts() {{
+            var usernameInput = document.getElementById('signup-username');
+            var form = usernameInput ? usernameInput.closest('form') : null;
+            if (!form) {{
+                return null;
+            }}
+            var selects = form.querySelectorAll('select');
+            var continueButton = form.querySelector('button[type="submit"]');
+            if (selects.length < 3 || !continueButton) {{
+                return null;
+            }}
+            return {{
+                form: form,
+                selects: selects,
+                continueButton: continueButton
+            }};
+        }}
+
+        function getV2Warning() {{
+            var warning = document.getElementById('signup-username-description');
+            return warning
+                ? (warning.textContent || '').trim().toLowerCase()
+                : '';
+        }}
+
+        function findV2MaleButton(form) {{
+            var buttons = form.querySelectorAll('button[type="button"]');
+            for (var index = 0; index < buttons.length; index += 1) {{
+                if ((buttons[index].textContent || '').trim() === 'Male') {{
+                    return buttons[index];
+                }}
+            }}
+            return null;
+        }}
+
+        function fillSignupV2() {{
+            var parts = getV2Parts();
+            if (!parts) {{
+                return false;
+            }}
+            blockPasskeyPrompt();
+            var selectPrototype = window.HTMLSelectElement.prototype;
+            setNativeValue(parts.selects[0], selectPrototype, {month});
+            setNativeValue(parts.selects[1], selectPrototype, {day});
+            setNativeValue(parts.selects[2], selectPrototype, {year});
+            var maleButton = findV2MaleButton(parts.form);
+            if (maleButton && maleButton.getAttribute('aria-pressed') !== 'true') {{
+                maleButton.click();
+            }}
+            chooseUsername();
+            sessionStorage.setItem('_ram_pw', password);
+            setTimeout(function() {{ checkUsernameV2(60); }}, 900);
+            return true;
+        }}
+
+        function checkUsernameV2(attemptsLeft) {{
+            var parts = getV2Parts();
+            if (!parts) {{
+                return;
+            }}
+            var warningText = getV2Warning();
+
+            if (usernameRejected(warningText) && usernameIndex < usernames.length) {{
+                chooseUsername();
+                setTimeout(function() {{ checkUsernameV2(60); }}, 900);
+                return;
+            }}
+
+            if (!warningText && !parts.continueButton.disabled) {{
+                blockPasskeyPrompt();
+                parts.continueButton.click();
+                setTimeout(function() {{ fillPasswordV2(240, false); }}, 500);
+                return;
+            }}
+
+            if (attemptsLeft > 0) {{
+                setTimeout(
+                    function() {{ checkUsernameV2(attemptsLeft - 1); }},
+                    250
+                );
+            }}
+        }}
+
+        function fillPasswordV2(attemptsLeft, filled) {{
+            var passwordInput = document.getElementById('signup-v2-password');
+
+            if (isShown(passwordInput)) {{
+                if (!filled || passwordInput.value !== password) {{
+                    setNativeValue(
+                        passwordInput,
+                        window.HTMLInputElement.prototype,
+                        password
+                    );
+                    filled = true;
+                }}
+                var passwordForm = passwordInput.closest('form');
+                var passwordButton = passwordForm
+                    ? passwordForm.querySelector('button[type="submit"]')
+                    : null;
+                if (passwordButton && !passwordButton.disabled) {{
+                    passwordButton.click();
+                    setTimeout(function() {{ retrySubmitV2(90, 3); }}, 5000);
+                    return;
+                }}
+            }} else if (
+                usernameRejected(getV2Warning())
+                && usernameIndex < usernames.length
+            ) {{
+                chooseUsername();
+                setTimeout(function() {{ checkUsernameV2(60); }}, 900);
+                return;
+            }}
+
+            if (attemptsLeft > 0) {{
+                setTimeout(
+                    function() {{ fillPasswordV2(attemptsLeft - 1, filled); }},
+                    250
+                );
+            }}
+        }}
+
+        // The first submit can end in "An unknown error occurred" when the
+        // background human check fails. Submitting again shows the CAPTCHA.
+        function retrySubmitV2(attemptsLeft, retriesLeft) {{
+            var passwordInput = document.getElementById('signup-v2-password');
+            if (!isShown(passwordInput) || retriesLeft < 1) {{
+                return;
+            }}
+            var passwordForm = passwordInput.closest('form');
+            var passwordButton = passwordForm
+                ? passwordForm.querySelector('button[type="submit"]')
+                : null;
+            var challengeOpen = document.querySelector(
+                'iframe[src*="arkoselabs"], iframe[title*="challenge"], '
+                + '[role="dialog"], #px-captcha'
+            );
+            var nextDelay = 1000;
+
+            if (passwordButton && !passwordButton.disabled && !challengeOpen) {{
+                if (passwordInput.value !== password) {{
+                    setNativeValue(
+                        passwordInput,
+                        window.HTMLInputElement.prototype,
+                        password
+                    );
+                }} else {{
+                    passwordButton.click();
+                    retriesLeft -= 1;
+                    nextDelay = 5000;
+                }}
+            }}
+
+            if (attemptsLeft > 0) {{
+                setTimeout(
+                    function() {{ retrySubmitV2(attemptsLeft - 1, retriesLeft); }},
+                    nextDelay
                 );
             }}
         }}

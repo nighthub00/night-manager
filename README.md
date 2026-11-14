@@ -81,7 +81,7 @@ Switching from Evanovar RAM: copy your old `AccountManagerData/` folder next to 
 | Advanced Auto Apply | Apply the saved advanced profile on application startup and before Roblox launches, with basic presets taking priority. |
 | Roblox Downloader | Download the latest LIVE Windows Roblox Player deployment or a specific version hash to a chosen folder. |
 | Portable Chromium | Download or reinstall the latest supported Chromium build and its matching driver. |
-| Browser selection | Choose Chrome, Firefox, Edge, or portable Chromium for automated browser flows. Brave and Opera GX users can use portable Chromium. |
+| Browser selection | Choose Chrome, Firefox, Edge, Brave, or portable Chromium for automated browser flows. Opera GX users can use portable Chromium. |
 
 ### Application controls and integrations
 

@@ -5182,8 +5182,8 @@ class AccountManagerUIQt(QMainWindow): # Main Window
 
         f.addWidget(_sec("BROWSER ENGINE"))
         _br_lbl = QLabel(
-            "Supported browsers: Chrome, Firefox, Edge, and built-in Chromium. "
-            "Brave and Opera GX users should select Chromium."
+            "Supported browsers: Chrome, Firefox, Edge, Brave, and built-in Chromium. "
+            "Opera GX users should select Chromium."
         )
         _br_lbl.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
         _br_lbl.setWordWrap(True)
@@ -5198,6 +5198,8 @@ class AccountManagerUIQt(QMainWindow): # Main Window
              "Use Mozilla Firefox through Selenium. Mozilla Firefox must be installed."),
             ("edge", "Microsoft Edge",
              "Use Microsoft Edge through Selenium. Microsoft Edge must be installed."),
+            ("brave", "Brave",
+             "Use Brave through Selenium. Brave must be installed."),
             ("chromium", "Chromium",
              "Use the built-in Chromium and matching driver. Download it with the button below."),
         ]:
