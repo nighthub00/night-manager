@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -468,7 +469,27 @@ class DailyClaimPage(QWidget):
         schedule = store.get_schedule()
         dialog = QDialog(self)
         dialog.setWindowTitle("Daily Claim settings")
-        form = QFormLayout(dialog)
+        dialog.setSizeGripEnabled(True)
+        # The form scrolls inside the dialog, so it can be dragged smaller than its content
+        # (short screens) or wider (long folder paths); Save/Cancel stay pinned below it.
+        outer = QVBoxLayout(dialog)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.viewport().setAutoFillBackground(False)
+        body = QWidget()
+        body.setObjectName("dailyClaimSettingsBody")
+        body.setStyleSheet("QWidget#dailyClaimSettingsBody { background: transparent; }")
+        body_lay = QVBoxLayout(body)
+        body_lay.setContentsMargins(0, 0, 0, 0)
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        body_lay.addLayout(form)
+        body_lay.addStretch(1)  # extra height goes below the rows instead of spreading them
+        scroll.setWidget(body)
+        body.setAutoFillBackground(False)  # setWidget turns it on
+        outer.addWidget(scroll, 1)
 
         def spin(value, low, high, suffix="", decimals=None):
             box = QDoubleSpinBox() if decimals is not None else QSpinBox()
@@ -599,8 +620,36 @@ class DailyClaimPage(QWidget):
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
-        form.addRow(buttons)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        outer.addWidget(buttons)
+
+        saved = getattr(type(self), "_settings_dialog_size", None)
+
+        def _fit(final: bool) -> None:
+            # Runs before show (estimate) and once after it (the stylesheet is applied by then, so
+            # the hints are real). The form never scrolls sideways, so its minimum width is the floor.
+            margins = outer.contentsMargins()
+            side = margins.left() + margins.right() + scroll.verticalScrollBar().sizeHint().width()
+            dialog.setMinimumSize(body.minimumSizeHint().width() + side, 260)
+            if saved is not None:
+                if not final:
+                    dialog.resize(saved)
+                return
+            # Open at full content height when the screen allows it, otherwise fit the screen.
+            want_h = (body.sizeHint().height() + buttons.sizeHint().height() + outer.spacing()
+                      + margins.top() + margins.bottom())
+            want_w = max(460, body.sizeHint().width() + side)
+            screen = dialog.screen() or QApplication.primaryScreen()
+            if screen is not None:
+                avail = screen.availableGeometry()
+                want_h = min(want_h, avail.height() - 80)
+                want_w = min(want_w, avail.width() - 80)
+            dialog.resize(want_w, want_h)
+
+        _fit(False)
+        QTimer.singleShot(0, lambda: _fit(True))
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        type(self)._settings_dialog_size = dialog.size()
+        if not accepted:
             return
 
         new = ClaimSettings(
